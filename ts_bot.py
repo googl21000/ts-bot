@@ -13,10 +13,11 @@ import requests
 NY = ZoneInfo("America/New_York")
 SYMBOL = "XAU/USD"
 GOLD_TIMES = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
-ACTIVE_MIN = 60
+ACTIVE_MIN = 60        # مدة المراقبة بعد بداية الشمعة الذهبية
+SWEEP_MIN = 30         # السحب يجب أن يحدث داخل نصف ساعة الشمعة الذهبية نفسها
 SL_BUFFER = 0.30
 MIN_RR = 1.5
-TP_GAP = 1.0
+TP_GAP = 1.0           # أقل مسافة (دولار) بين TP1 و TP2
 POLL_SECONDS = 60
 SEEN_FILE = "seen.json"
 
@@ -26,6 +27,7 @@ TG_CHAT = os.getenv("TG_CHAT", "")
 AI_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 
+# ===================== البيانات =====================
 def fetch_1m():
     r = requests.get(
         "https://api.twelvedata.com/time_series",
@@ -52,10 +54,12 @@ def resample(df1, rule):
 
 
 def mirror(df):
+    """قلب السعر: يحوّل الشراء إلى بيع حتى نكتب المنطق مرة واحدة"""
     return pd.DataFrame({"open": -df.open, "high": -df.low,
                          "low": -df.high, "close": -df.close}, index=df.index)
 
 
+# ===================== أدوات هيكلية =====================
 def swing_points(df, n=2):
     hi, lo = [], []
     for i in range(n, len(df) - n):
@@ -68,6 +72,7 @@ def swing_points(df, n=2):
 
 
 def poi_zones(df, look=72):
+    """مناطق الاهتمام على فريم الساعة: FVG, OB, IFVG"""
     df = df.tail(look)
     zones = []
     for i in range(2, len(df)):
@@ -101,10 +106,12 @@ def active_starts(now):
     return out
 
 
+# ===================== منطق البيع (الشراء = نفسه على السعر المقلوب) =====================
 def pick_targets(entry, risk, lows):
+    """TP1 = أول قاع على اليسار يعطي MIN_RR ، TP2 = القاع الذي بعده"""
     cand = []
     for v in sorted({round(v, 2) for v in lows if v < entry}, reverse=True):
-        if not cand or cand[-1] - v >= TP_GAP:
+        if not cand or cand[-1] - v >= TP_GAP:   # دمج القيعان المتقاربة
             cand.append(v)
     for n, v in enumerate(cand):
         if entry - v >= MIN_RR * risk:
@@ -133,6 +140,7 @@ def finish(df3, j, e, entry, ext, lows, kind):
 
 
 def cisd_signal(df3, b, lows):
+    """CISD: بداية آخر موجة صاعدة قبل قمة السحب. إغلاق تحتها ثم الدخول عند اختبارها"""
     ext, e = df3.high.iloc[b], b
     bull = lambda i: df3.close.iloc[i] > df3.open.iloc[i]
     for k in range(b + 1, len(df3)):
@@ -155,6 +163,7 @@ def cisd_signal(df3, b, lows):
 
 
 def mss_signal(df3, b, lows):
+    """MSS: كسر آخر قاع هيكلي، ثم الدخول عند FVG أو OB على 3 دقائق"""
     ext, e = df3.high.iloc[b], b
     for k in range(b + 1, len(df3)):
         c = df3.iloc[k]
@@ -182,23 +191,40 @@ def mss_signal(df3, b, lows):
     return None
 
 
+def second_half_ok(df30, start):
+    """شمعة :30 تُعتمد فقط إذا لم تسحب شمعة :00 قمة أو قاع الشمعة التي قبلها"""
+    if start.minute != 30:
+        return True
+    a = df30[df30.index == start - pd.Timedelta(minutes=30)]
+    b = df30[df30.index == start - pd.Timedelta(minutes=60)]
+    if not len(a) or not len(b):
+        return False
+    return bool(a.high.iloc[0] <= b.high.iloc[0] and a.low.iloc[0] >= b.low.iloc[0])
+
+
+def find_breach(df3, level, start):
+    """أول شمعة 3د تتجاوز المستوى داخل نصف ساعة الشمعة الذهبية"""
+    for i in range(1, len(df3)):
+        t = df3.index[i]
+        if start <= t < start + timedelta(minutes=SWEEP_MIN):
+            if df3.high.iloc[i] > level and df3.close.iloc[i - 1] <= level:
+                return i
+    return None
+
+
 def scan_sell(df3, df30, df1h, start):
+    if not second_half_ok(df30, start):
+        return []
     p = df30[df30.index < start].tail(1)
     if not len(p):
         return []
-    level = p.high.iloc[0]
+    level = p.high.iloc[0]                      # قمة شمعة 30د السابقة
     h1 = df1h[df1h.index + pd.Timedelta("60min") <= start]
     zin = [z for z in poi_zones(h1) if z["lo"] <= level <= z["hi"]]
     if not zin:
-        return []
+        return []                               # القمة يجب أن تكون داخل منطقة الساعة
 
-    b = None
-    for i in range(1, len(df3)):
-        t = df3.index[i]
-        if start <= t < start + timedelta(minutes=ACTIVE_MIN):
-            if df3.high.iloc[i] > level and df3.close.iloc[i - 1] <= level:
-                b = i
-                break
+    b = find_breach(df3, level, start)
     if b is None:
         return []
 
@@ -241,7 +267,7 @@ def scan(df1, now):
             r["dir"] = "buy"
             out.append(r)
     seen_k, uniq = set(), []
-    for r in out:
+    for r in out:                               # حذف المكرر بين شمعتين ذهبيتين
         k = (r["dir"], r["kind"], r["confirm_time"])
         if k not in seen_k:
             seen_k.add(k)
@@ -249,6 +275,7 @@ def scan(df1, now):
     return uniq
 
 
+# ===================== التنبيهات =====================
 def telegram(text):
     requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                   data=dict(chat_id=TG_CHAT, text=text), timeout=15)
