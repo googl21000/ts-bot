@@ -1,6 +1,6 @@
 """
-TS Strategy Bot - XAUUSD
-الوقت + السحب (Sweep) + MSS + دخول OB/FVG  ->  تنبيه تيليجرام
+TS Strategy Bot V2 - XAUUSD
+منطقة الساعة (1H) + سحب قمة/قاع شمعة 30د السابقة + CISD أو MSS + أهداف TP1/TP2
 كل الأوقات بتوقيت نيويورك.
 """
 import os, time, json
@@ -10,13 +10,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-# ===================== الإعدادات =====================
 NY = ZoneInfo("America/New_York")
 SYMBOL = "XAU/USD"
 GOLD_TIMES = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
 ACTIVE_MIN = 60
 SL_BUFFER = 0.30
 MIN_RR = 1.5
+TP_GAP = 1.0
 POLL_SECONDS = 60
 SEEN_FILE = "seen.json"
 
@@ -51,6 +51,11 @@ def resample(df1, rule):
     return r[end <= last]
 
 
+def mirror(df):
+    return pd.DataFrame({"open": -df.open, "high": -df.low,
+                         "low": -df.high, "close": -df.close}, index=df.index)
+
+
 def swing_points(df, n=2):
     hi, lo = [], []
     for i in range(n, len(df) - n):
@@ -62,8 +67,8 @@ def swing_points(df, n=2):
     return hi, lo
 
 
-def poi_zones(df30, look=60):
-    df = df30.tail(look)
+def poi_zones(df, look=72):
+    df = df.tail(look)
     zones = []
     for i in range(2, len(df)):
         a, c = df.iloc[i - 2], df.iloc[i]
@@ -96,124 +101,152 @@ def active_starts(now):
     return out
 
 
-def confirm(df3, s, d, liq_lo, liq_hi):
-    sweep = df3.iloc[s]
-    hist = df3.iloc[max(0, s - 40):s]
-    sh, sl = swing_points(hist)
-    sell = d == "sell"
-    pts = sl if sell else sh
-    if not pts:
-        return None
-    mss = pts[-1]
+def pick_targets(entry, risk, lows):
+    cand = []
+    for v in sorted({round(v, 2) for v in lows if v < entry}, reverse=True):
+        if not cand or cand[-1] - v >= TP_GAP:
+            cand.append(v)
+    for n, v in enumerate(cand):
+        if entry - v >= MIN_RR * risk:
+            return v, (cand[n + 1] if n + 1 < len(cand) else None)
+    return None, None
 
-    j = None
-    for k in range(s + 1, len(df3)):
-        c = df3.iloc[k]
-        if sell:
-            if c.high > sweep.high:
-                return None
-            if c.close < mss:
-                j = k
-                break
-        else:
-            if c.low < sweep.low:
-                return None
-            if c.close > mss:
-                j = k
-                break
-    if j is None:
-        return None
 
-    seg = df3.iloc[s:j + 1]
-    zone = None
-    for i in range(2, len(seg)):
-        a, c = seg.iloc[i - 2], seg.iloc[i]
-        if sell and c.high < a.low:
-            zone = ("FVG", c.high, a.low)
-        if (not sell) and c.low > a.high:
-            zone = ("FVG", a.high, c.low)
-    if zone is None:
-        for i in range(len(seg) - 2, -1, -1):
-            o = seg.iloc[i]
-            if (sell and o.close > o.open) or ((not sell) and o.close < o.open):
-                zone = ("OB", o.low, o.high)
-                break
-    if zone is None:
+def finish(df3, j, e, entry, ext, lows, kind):
+    sl = ext + SL_BUFFER
+    risk = sl - entry
+    if risk <= 0:
         return None
-
-    kind, lo, hi = zone
-    entry = (lo + hi) / 2
-    if sell:
-        sl_price = sweep.high + SL_BUFFER
-        risk = sl_price - entry
-        cands = [v for v in liq_lo if v < entry - risk * MIN_RR]
-        tp = max(cands) if cands else None
-    else:
-        sl_price = sweep.low - SL_BUFFER
-        risk = entry - sl_price
-        cands = [v for v in liq_hi if v > entry + risk * MIN_RR]
-        tp = min(cands) if cands else None
-    if risk <= 0 or tp is None:
+    tp1, tp2 = pick_targets(entry, risk, lows)
+    if tp1 is None:
         return None
-
     after = df3.iloc[j + 1:]
+    filled = False
     if len(after):
-        if sell and ((after.low <= tp).any() or (after.high >= sl_price).any()):
+        if (after.high >= sl).any() or (after.low <= tp1).any():
             return None
-        if (not sell) and ((after.high >= tp).any() or (after.low <= sl_price).any()):
-            return None
-        filled = (after.high >= entry).any() if sell else (after.low <= entry).any()
-    else:
-        filled = False
-
-    return dict(dir=d, entry_zone=kind, entry=round(entry, 2), sl=round(sl_price, 2),
-                tp=round(tp, 2), rr=round(abs(tp - entry) / risk, 2),
-                sweep_time=str(df3.index[s]), mss_time=str(df3.index[j]),
+        filled = bool((after.high >= entry).any())
+    return dict(kind=kind, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+                rr1=round((entry - tp1) / risk, 2),
+                sweep_time=str(df3.index[e]), confirm_time=str(df3.index[j]),
                 status="تم الدخول" if filled else "أمر معلّق (Limit)")
 
 
-def find_setups(df3, df30, zones, start):
-    res = []
-    p30 = df30[df30.index < start].tail(1)
-    p_hi = [p30.high.iloc[0]] if len(p30) else []
-    p_lo = [p30.low.iloc[0]] if len(p30) else []
-
-    h30, l30 = swing_points(df30.tail(80))
-    h3, l3 = swing_points(df3.tail(200))
-    liq_hi, liq_lo = h30 + h3 + p_hi, l30 + l3 + p_lo
-
-    for s in range(len(df3)):
-        t = df3.index[s]
-        if not (start <= t < start + timedelta(minutes=ACTIVE_MIN)):
+def cisd_signal(df3, b, lows):
+    ext, e = df3.high.iloc[b], b
+    bull = lambda i: df3.close.iloc[i] > df3.open.iloc[i]
+    for k in range(b + 1, len(df3)):
+        c = df3.iloc[k]
+        if c.high > ext:
+            ext, e = c.high, k
             continue
-        c = df3.iloc[s]
-        sh, sl = swing_points(df3.iloc[max(0, s - 40):s])
-        for d in ("sell", "buy"):
-            if d == "sell":
-                lv = [v for v in sh + p_hi if c.high > v > c.close]
-                zs = [z for z in zones if z["dir"] == "bear" and c.high >= z["lo"] and c.low <= z["hi"]]
-            else:
-                lv = [v for v in sl + p_lo if c.low < v < c.close]
-                zs = [z for z in zones if z["dir"] == "bull" and c.high >= z["lo"] and c.low <= z["hi"]]
-            if lv and zs:
-                r = confirm(df3, s, d, liq_lo, liq_hi)
-                if r:
-                    r["poi"] = zs[0]["kind"] + " 30m"
-                    r["golden"] = start.strftime("%H:%M")
-                    res.append(r)
-    return res
+        end = e
+        while end >= 0 and not bull(end):
+            end -= 1
+        if end < 0:
+            continue
+        r = end
+        while r - 1 >= 0 and bull(r - 1):
+            r -= 1
+        cisd = df3.open.iloc[r]
+        if cisd < ext and c.close < cisd:
+            return finish(df3, k, e, cisd, ext, lows, "CISD")
+    return None
+
+
+def mss_signal(df3, b, lows):
+    ext, e = df3.high.iloc[b], b
+    for k in range(b + 1, len(df3)):
+        c = df3.iloc[k]
+        if c.high > ext:
+            ext, e = c.high, k
+            continue
+        _, sl_pts = swing_points(df3.iloc[max(0, e - 40):e])
+        if not sl_pts or c.close >= sl_pts[-1]:
+            continue
+        seg = df3.iloc[e:k + 1]
+        zone = None
+        for i in range(2, len(seg)):
+            a, cc = seg.iloc[i - 2], seg.iloc[i]
+            if cc.high < a.low:
+                zone = ("FVG", cc.high, a.low)
+        if zone is None:
+            for i in range(len(seg) - 2, -1, -1):
+                o = seg.iloc[i]
+                if o.close > o.open:
+                    zone = ("OB", o.low, o.high)
+                    break
+        if zone is None:
+            return None
+        return finish(df3, k, e, (zone[1] + zone[2]) / 2, ext, lows, "MSS+" + zone[0])
+    return None
+
+
+def scan_sell(df3, df30, df1h, start):
+    p = df30[df30.index < start].tail(1)
+    if not len(p):
+        return []
+    level = p.high.iloc[0]
+    h1 = df1h[df1h.index + pd.Timedelta("60min") <= start]
+    zin = [z for z in poi_zones(h1) if z["lo"] <= level <= z["hi"]]
+    if not zin:
+        return []
+
+    b = None
+    for i in range(1, len(df3)):
+        t = df3.index[i]
+        if start <= t < start + timedelta(minutes=ACTIVE_MIN):
+            if df3.high.iloc[i] > level and df3.close.iloc[i - 1] <= level:
+                b = i
+                break
+    if b is None:
+        return []
+
+    _, l30 = swing_points(df30[df30.index < start].tail(80))
+    _, l3 = swing_points(df3.iloc[:b].tail(200))
+    lows = l30 + l3
+
+    out = []
+    for fn in (cisd_signal, mss_signal):
+        r = fn(df3, b, lows)
+        if r:
+            r["poi"] = zin[0]["kind"] + " 1H"
+            r["level"] = level
+            r["golden"] = start.strftime("%H:%M")
+            out.append(r)
+    return out
+
+
+def unmirror(r):
+    r = dict(r)
+    for k in ("entry", "sl", "tp1", "tp2", "level"):
+        if r.get(k) is not None:
+            r[k] = -r[k]
+    return r
 
 
 def scan(df1, now):
     starts = active_starts(now)
     if not starts:
         return []
-    df3, df30 = resample(df1, "3min"), resample(df1, "30min")
-    zones = poi_zones(df30)
+    d3, d30, d1h = resample(df1, "3min"), resample(df1, "30min"), resample(df1, "60min")
+    m3, m30, m1h = mirror(d3), mirror(d30), mirror(d1h)
     out = []
     for st in starts:
-        out += find_setups(df3, df30, zones, st)
-    return out
+        for r in scan_sell(d3, d30, d1h, st):
+            r["dir"] = "sell"
+            out.append(r)
+        for r in scan_sell(m3, m30, m1h, st):
+            r = unmirror(r)
+            r["dir"] = "buy"
+            out.append(r)
+    seen_k, uniq = set(), []
+    for r in out:
+        k = (r["dir"], r["kind"], r["confirm_time"])
+        if k not in seen_k:
+            seen_k.add(k)
+            uniq.append(r)
+    return uniq
 
 
 def telegram(text):
@@ -231,9 +264,8 @@ def ai_review(setup):
                      "content-type": "application/json"},
             json=dict(model="claude-sonnet-5-5", max_tokens=300, messages=[{
                 "role": "user",
-                "content": "أنت مراجع لاستراتيجية TS (سحب سيولة + MSS) على الذهب. "
-                           "راجع هذا الـ setup باختصار شديد (3 أسطر): نقاط القوة والخطر وتقييم من 10.\n"
-                           + json.dumps(setup, ensure_ascii=False)}]),
+                "content": "راجع هذا الـ setup لاستراتيجية TS على الذهب باختصار (3 أسطر): "
+                           "القوة والخطر وتقييم من 10.\n" + json.dumps(setup, ensure_ascii=False)}]),
             timeout=30)
         return "\n\n🤖 مراجعة Claude:\n" + r.json()["content"][0]["text"]
     except Exception:
@@ -242,14 +274,17 @@ def ai_review(setup):
 
 def fmt(s):
     arrow = "🔴 SELL" if s["dir"] == "sell" else "🟢 BUY"
+    tp2 = f"{s['tp2']:.2f}" if s["tp2"] is not None else "—"
     return (f"{arrow} XAUUSD\n"
             f"⏰ الشمعة الذهبية: {s['golden']} (NY)\n"
             f"📍 المنطقة: {s['poi']}\n"
-            f"🎯 الدخول ({s['entry_zone']} 3m): {s['entry']}\n"
-            f"🛑 الوقف: {s['sl']}\n"
-            f"✅ الهدف: {s['tp']}  (RR {s['rr']})\n"
+            f"🎯 تأكيد: {s['kind']}\n"
+            f"➡️ الدخول: {s['entry']:.2f}\n"
+            f"🛑 الوقف: {s['sl']:.2f}\n"
+            f"✅ TP1: {s['tp1']:.2f} (RR {s['rr1']})\n"
+            f"✅ TP2: {tp2}\n"
             f"📌 الحالة: {s['status']}\n"
-            f"Sweep: {s['sweep_time'][11:16]} | MSS: {s['mss_time'][11:16]}")
+            f"Sweep: {s['sweep_time'][11:16]} | تأكيد: {s['confirm_time'][11:16]}")
 
 
 def load_seen():
@@ -270,7 +305,7 @@ def upcoming(now, mins=35):
 def main():
     seen = load_seen()
     one_shot = bool(os.getenv("ONE_SHOT"))
-    print("TS bot started")
+    print("TS bot V2 started")
     while True:
         try:
             now = pd.Timestamp.now(tz=NY)
@@ -281,7 +316,7 @@ def main():
             if busy:
                 df1 = fetch_1m()
                 for s in scan(df1, now):
-                    key = f"{s['dir']}|{s['sweep_time']}"
+                    key = f"{s['dir']}|{s['kind']}|{s['confirm_time']}"
                     if key in seen:
                         continue
                     seen.add(key)
