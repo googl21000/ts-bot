@@ -1,0 +1,27 @@
+name: Backtest
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "عدد الأيام"
+        default: "90"
+jobs:
+  bt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pandas requests
+      - run: python backtest.py
+        env:
+          BT_DAYS: ${{ github.event.inputs.days }}
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trades
+          path: trades.csv
