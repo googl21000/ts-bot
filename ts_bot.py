@@ -219,11 +219,14 @@ def scan_sell(df3, df30, df1h, start):
     if not len(p):
         return []
     level = p.high.iloc[0]                      # قمة شمعة 30د السابقة
-    h1 = df1h[df1h.index + pd.Timedelta("60min") <= start]
-    zin = [z for z in poi_zones(h1) if z["lo"] <= level <= z["hi"]]
-    if not zin:
-        return []                               # القمة يجب أن تكون داخل منطقة الساعة
 
+    # 1) مناطق الساعة على اليسار (قبل الوقت الذهبي)، وليست كلها تحت المستوى
+    h1 = df1h[df1h.index + pd.Timedelta("60min") <= start]
+    zrel = [z for z in poi_zones(h1) if z["hi"] >= level]
+    if not zrel:
+        return []
+
+    # 2) السحب داخل نصف ساعة الشمعة الذهبية
     b = find_breach(df3, level, start)
     if b is None:
         return []
@@ -235,11 +238,18 @@ def scan_sell(df3, df30, df1h, start):
     out = []
     for fn in (cisd_signal, mss_signal):
         r = fn(df3, b, lows)
-        if r:
-            r["poi"] = zin[0]["kind"] + " 1H"
-            r["level"] = level
-            r["golden"] = start.strftime("%H:%M")
-            out.append(r)
+        if not r:
+            continue
+        ext = r["sl"] - SL_BUFFER               # أعلى نقطة وصلها السحب
+        # 3) المنطقة تحتوي المستوى، أو لمسها السعر أثناء السحب
+        zt = [z for z in zrel if z["lo"] <= ext]
+        if not zt:
+            continue
+        zt.sort(key=lambda z: abs(z["lo"] - level))
+        r["poi"] = zt[0]["kind"] + " 1H"
+        r["level"] = level
+        r["golden"] = start.strftime("%H:%M")
+        out.append(r)
     return out
 
 
@@ -356,3 +366,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
