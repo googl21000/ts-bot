@@ -1,369 +1,267 @@
-"""
-TS Strategy Bot V2 - XAUUSD
-منطقة الساعة (1H) + سحب قمة/قاع شمعة 30د السابقة + CISD أو MSS + أهداف TP1/TP2
-كل الأوقات بتوقيت نيويورك.
-"""
-import os, time, json
-from datetime import timedelta
-from zoneinfo import ZoneInfo
-
+import os, sys, json, time, requests
 import pandas as pd
-import requests
+from datetime import datetime, timezone, timedelta
 
-NY = ZoneInfo("America/New_York")
-SYMBOL = "XAU/USD"
-GOLD_TIMES = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
-ACTIVE_MIN = 60        # مدة المراقبة بعد بداية الشمعة الذهبية
-SWEEP_MIN = 30         # السحب يجب أن يحدث داخل نصف ساعة الشمعة الذهبية نفسها
-SL_BUFFER = 0.30
-MIN_RR = 1.5
-TP_GAP = 1.0           # أقل مسافة (دولار) بين TP1 و TP2
-POLL_SECONDS = 60
-SEEN_FILE = "seen.json"
+TD_KEY = os.environ.get("TD_API_KEY", "")
+TG_TOKEN = os.environ.get("TG_TOKEN", "")
+TG_CHAT = os.environ.get("TG_CHAT_ID", "")
+SYMBOL, TF, BAR = "XAU/USD", "5min", 5
+STATE = "state.json"
+SPREAD = 0.9      # دولار
+STALE_MIN = 10    # لا ترسل إشارة متأخرة أكثر من هذا
 
-TD_KEY = os.getenv("TWELVEDATA_KEY", "")
-TG_TOKEN = os.getenv("TG_TOKEN", "")
-TG_CHAT = os.getenv("TG_CHAT", "")
-AI_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+C = dict(
+    sess=(8 * 60, 13 * 60 + 30),   # UTC = 09:00-14:30 الجزائر
+    lookback=36, sweep_win=6, atr_n=14, body_atr=0.5,
+    buffer=0.5, min_risk=2.0, max_risk=6.0,
+    tp=(5.0, 10.0, 18.0),
+    max_signals=3, max_sl=2, day_target=10.0,
+    cool_min=15, expire_h=3,
+)
 
+# ---------------- data ----------------
+def fetch(n=300, end=None):
+    p = dict(symbol=SYMBOL, interval=TF, outputsize=n, timezone="UTC", apikey=TD_KEY)
+    if end:
+        p["end_date"] = end
+    r = requests.get("https://api.twelvedata.com/time_series", params=p, timeout=30).json()
+    if "values" not in r:
+        raise RuntimeError(r)
+    df = pd.DataFrame(r["values"])
+    df["t"] = pd.to_datetime(df["datetime"], utc=True)
+    for c in ("open", "high", "low", "close"):
+        df[c] = df[c].astype(float)
+    return df[["t", "open", "high", "low", "close"]].sort_values("t").reset_index(drop=True)
 
-# ===================== البيانات =====================
-def fetch_1m():
-    r = requests.get(
-        "https://api.twelvedata.com/time_series",
-        params=dict(symbol=SYMBOL, interval="1min", outputsize=5000,
-                    timezone="America/New_York", apikey=TD_KEY),
-        timeout=20,
-    )
-    j = r.json()
-    if "values" not in j:
-        raise RuntimeError(j)
-    df = pd.DataFrame(j["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(
-        NY, ambiguous="NaT", nonexistent="NaT")
-    df = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
-    return df[["open", "high", "low", "close"]].astype(float)
+def atr(df, n):
+    pc = df.close.shift()
+    tr = pd.concat([df.high - df.low, (df.high - pc).abs(), (df.low - pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
 
+def in_session(t):
+    m = t.hour * 60 + t.minute
+    return t.weekday() < 5 and C["sess"][0] <= m < C["sess"][1]
 
-def resample(df1, rule):
-    r = df1.resample(rule, label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
-    end = r.index + pd.Timedelta(rule)
-    last = df1.index[-1] + pd.Timedelta("1min")
-    return r[end <= last]
+# ---------------- strategy ----------------
+def signal(df):
+    n = C["lookback"] + C["sweep_win"]
+    if len(df) < n + 2:
+        return None
+    last = df.iloc[-1]
+    t_in = last.t + timedelta(minutes=BAR)
+    if not in_session(t_in):
+        return None
+    a = atr(df, C["atr_n"]).iloc[-1]
+    if not a > 0 or abs(last.close - last.open) < C["body_atr"] * a:
+        return None
+    w = df.iloc[-C["sweep_win"]:]
+    ref = df.iloc[-n:-C["sweep_win"]]
+    for buy in (True, False):
+        ex = w.low.min() if buy else w.high.max()
+        lvl = ref.low.min() if buy else ref.high.max()
+        if buy and not (ex < lvl and last.close > lvl and last.close > last.open):
+            continue
+        if not buy and not (ex > lvl and last.close < lvl and last.close < last.open):
+            continue
+        pos = list(w.index).index(w.low.idxmin() if buy else w.high.idxmax())
+        mid = w.iloc[pos:-1]
+        if len(mid) and ((buy and last.close <= mid.high.max()) or (not buy and last.close >= mid.low.min())):
+            continue
+        e = last.close
+        sl = ex - C["buffer"] if buy else ex + C["buffer"]
+        risk = abs(e - sl)
+        if risk < C["min_risk"]:
+            risk = C["min_risk"]
+            sl = e - risk if buy else e + risk
+        if risk > C["max_risk"]:
+            continue
+        d = 1 if buy else -1
+        return dict(side="buy" if buy else "sell", entry=round(e, 2), sl=round(sl, 2),
+                    tps=[round(e + d * x, 2) for x in C["tp"]], t=t_in.isoformat())
+    return None
 
-
-def mirror(df):
-    """قلب السعر: يحوّل الشراء إلى بيع حتى نكتب المنطق مرة واحدة"""
-    return pd.DataFrame({"open": -df.open, "high": -df.low,
-                         "low": -df.high, "close": -df.close}, index=df.index)
-
-
-# ===================== أدوات هيكلية =====================
-def swing_points(df, n=2):
-    hi, lo = [], []
-    for i in range(n, len(df) - n):
-        w = df.iloc[i - n:i + n + 1]
-        if df.high.iloc[i] == w.high.max():
-            hi.append(df.high.iloc[i])
-        if df.low.iloc[i] == w.low.min():
-            lo.append(df.low.iloc[i])
-    return hi, lo
-
-
-def poi_zones(df, look=72):
-    """مناطق الاهتمام على فريم الساعة: FVG, OB, IFVG"""
-    df = df.tail(look)
-    zones = []
-    for i in range(2, len(df)):
-        a, c = df.iloc[i - 2], df.iloc[i]
-        if c.low > a.high:
-            lo, hi, dr = a.high, c.low, "bull"
-        elif c.high < a.low:
-            lo, hi, dr = c.high, a.low, "bear"
+def step(s, b):
+‎    """يحدّث الصفقة بشمعة واحدة. الوقف أولاً عند التعارض داخل الشمعة."""
+    ev = []
+    buy = s["side"] == "buy"
+    d = 1 if buy else -1
+    if (b.low <= s["cur_sl"]) if buy else (b.high >= s["cur_sl"]):
+        s["pnl"] += (3 - s["stage"]) / 3 * d * (s["cur_sl"] - s["entry"])
+        s["closed"] = True
+        ev.append("SL" if s["stage"] == 0 else "BE")
+        return ev
+    while s["stage"] < 3:
+        tp = s["tps"][s["stage"]]
+        if (b.high >= tp) if buy else (b.low <= tp):
+            s["pnl"] += d * (tp - s["entry"]) / 3
+            s["stage"] += 1
+            ev.append(f"TP{s['stage']}")
+            if s["stage"] == 1:
+                s["cur_sl"] = s["entry"]
         else:
-            continue
-        later = df.iloc[i + 1:]
-        inverted = (later.close < lo).any() if dr == "bull" else (later.close > hi).any()
-        if inverted:
-            zones.append(dict(kind="IFVG", dir="bear" if dr == "bull" else "bull", lo=lo, hi=hi))
-            continue
-        zones.append(dict(kind="FVG", dir=dr, lo=lo, hi=hi))
-        for k in range(i - 2, max(i - 7, -1), -1):
-            o = df.iloc[k]
-            if (dr == "bull" and o.close < o.open) or (dr == "bear" and o.close > o.open):
-                zones.append(dict(kind="OB", dir=dr, lo=o.low, hi=o.high))
-                break
-    return zones
+            break
+    if s["stage"] == 3:
+        s["closed"] = True
+    return ev
 
+# ---------------- telegram ----------------
+def tg(msg):
+    print(msg)
+    if TG_TOKEN:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": msg}, timeout=30)
 
-def active_starts(now):
-    out = []
-    for h, m in GOLD_TIMES:
-        st = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if st <= now < st + timedelta(minutes=ACTIVE_MIN):
-            out.append(st)
-    return out
-
-
-# ===================== منطق البيع (الشراء = نفسه على السعر المقلوب) =====================
-def pick_targets(entry, risk, lows):
-    """TP1 = أول قاع على اليسار يعطي MIN_RR ، TP2 = القاع الذي بعده"""
-    cand = []
-    for v in sorted({round(v, 2) for v in lows if v < entry}, reverse=True):
-        if not cand or cand[-1] - v >= TP_GAP:   # دمج القيعان المتقاربة
-            cand.append(v)
-    for n, v in enumerate(cand):
-        if entry - v >= MIN_RR * risk:
-            return v, (cand[n + 1] if n + 1 < len(cand) else None)
-    return None, None
-
-
-def finish(df3, j, e, entry, ext, lows, kind):
-    sl = ext + SL_BUFFER
-    risk = sl - entry
-    if risk <= 0:
-        return None
-    tp1, tp2 = pick_targets(entry, risk, lows)
-    if tp1 is None:
-        return None
-    after = df3.iloc[j + 1:]
-    filled = False
-    if len(after):
-        if (after.high >= sl).any() or (after.low <= tp1).any():
-            return None
-        filled = bool((after.high >= entry).any())
-    return dict(kind=kind, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                rr1=round((entry - tp1) / risk, 2),
-                sweep_time=str(df3.index[e]), confirm_time=str(df3.index[j]),
-                status="تم الدخول" if filled else "أمر معلّق (Limit)")
-
-
-def cisd_signal(df3, b, lows):
-    """CISD: بداية آخر موجة صاعدة قبل قمة السحب. إغلاق تحتها ثم الدخول عند اختبارها"""
-    ext, e = df3.high.iloc[b], b
-    bull = lambda i: df3.close.iloc[i] > df3.open.iloc[i]
-    for k in range(b + 1, len(df3)):
-        c = df3.iloc[k]
-        if c.high > ext:
-            ext, e = c.high, k
-            continue
-        end = e
-        while end >= 0 and not bull(end):
-            end -= 1
-        if end < 0:
-            continue
-        r = end
-        while r - 1 >= 0 and bull(r - 1):
-            r -= 1
-        cisd = df3.open.iloc[r]
-        if cisd < ext and c.close < cisd:
-            return finish(df3, k, e, cisd, ext, lows, "CISD")
-    return None
-
-
-def mss_signal(df3, b, lows):
-    """MSS: كسر آخر قاع هيكلي، ثم الدخول عند FVG أو OB على 3 دقائق"""
-    ext, e = df3.high.iloc[b], b
-    for k in range(b + 1, len(df3)):
-        c = df3.iloc[k]
-        if c.high > ext:
-            ext, e = c.high, k
-            continue
-        _, sl_pts = swing_points(df3.iloc[max(0, e - 40):e])
-        if not sl_pts or c.close >= sl_pts[-1]:
-            continue
-        seg = df3.iloc[e:k + 1]
-        zone = None
-        for i in range(2, len(seg)):
-            a, cc = seg.iloc[i - 2], seg.iloc[i]
-            if cc.high < a.low:
-                zone = ("FVG", cc.high, a.low)
-        if zone is None:
-            for i in range(len(seg) - 2, -1, -1):
-                o = seg.iloc[i]
-                if o.close > o.open:
-                    zone = ("OB", o.low, o.high)
-                    break
-        if zone is None:
-            return None
-        return finish(df3, k, e, (zone[1] + zone[2]) / 2, ext, lows, "MSS+" + zone[0])
-    return None
-
-
-def second_half_ok(df30, start):
-    """شمعة :30 تُعتمد فقط إذا لم تسحب شمعة :00 قمة أو قاع الشمعة التي قبلها"""
-    if start.minute != 30:
-        return True
-    a = df30[df30.index == start - pd.Timedelta(minutes=30)]
-    b = df30[df30.index == start - pd.Timedelta(minutes=60)]
-    if not len(a) or not len(b):
-        return False
-    return bool(a.high.iloc[0] <= b.high.iloc[0] and a.low.iloc[0] >= b.low.iloc[0])
-
-
-def find_breach(df3, level, start):
-    """أول شمعة 3د تتجاوز المستوى داخل نصف ساعة الشمعة الذهبية"""
-    for i in range(1, len(df3)):
-        t = df3.index[i]
-        if start <= t < start + timedelta(minutes=SWEEP_MIN):
-            if df3.high.iloc[i] > level and df3.close.iloc[i - 1] <= level:
-                return i
-    return None
-
-
-def scan_sell(df3, df30, df1h, start):
-    if not second_half_ok(df30, start):
-        return []
-    p = df30[df30.index < start].tail(1)
-    if not len(p):
-        return []
-    level = p.high.iloc[0]                      # قمة شمعة 30د السابقة
-
-    # 1) مناطق الساعة على اليسار (قبل الوقت الذهبي)، وليست كلها تحت المستوى
-    h1 = df1h[df1h.index + pd.Timedelta("60min") <= start]
-    zrel = [z for z in poi_zones(h1) if z["hi"] >= level]
-    if not zrel:
-        return []
-
-    # 2) السحب داخل نصف ساعة الشمعة الذهبية
-    b = find_breach(df3, level, start)
-    if b is None:
-        return []
-
-    _, l30 = swing_points(df30[df30.index < start].tail(80))
-    _, l3 = swing_points(df3.iloc[:b].tail(200))
-    lows = l30 + l3
-
-    out = []
-    for fn in (cisd_signal, mss_signal):
-        r = fn(df3, b, lows)
-        if not r:
-            continue
-        ext = r["sl"] - SL_BUFFER               # أعلى نقطة وصلها السحب
-        # 3) المنطقة تحتوي المستوى، أو لمسها السعر أثناء السحب
-        zt = [z for z in zrel if z["lo"] <= ext]
-        if not zt:
-            continue
-        zt.sort(key=lambda z: abs(z["lo"] - level))
-        r["poi"] = zt[0]["kind"] + " 1H"
-        r["level"] = level
-        r["golden"] = start.strftime("%H:%M")
-        out.append(r)
-    return out
-
-
-def unmirror(r):
-    r = dict(r)
-    for k in ("entry", "sl", "tp1", "tp2", "level"):
-        if r.get(k) is not None:
-            r[k] = -r[k]
-    return r
-
-
-def scan(df1, now):
-    starts = active_starts(now)
-    if not starts:
-        return []
-    d3, d30, d1h = resample(df1, "3min"), resample(df1, "30min"), resample(df1, "60min")
-    m3, m30, m1h = mirror(d3), mirror(d30), mirror(d1h)
-    out = []
-    for st in starts:
-        for r in scan_sell(d3, d30, d1h, st):
-            r["dir"] = "sell"
-            out.append(r)
-        for r in scan_sell(m3, m30, m1h, st):
-            r = unmirror(r)
-            r["dir"] = "buy"
-            out.append(r)
-    seen_k, uniq = set(), []
-    for r in out:                               # حذف المكرر بين شمعتين ذهبيتين
-        k = (r["dir"], r["kind"], r["confirm_time"])
-        if k not in seen_k:
-            seen_k.add(k)
-            uniq.append(r)
-    return uniq
-
-
-# ===================== التنبيهات =====================
-def telegram(text):
-    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                  data=dict(chat_id=TG_CHAT, text=text), timeout=15)
-
-
-def ai_review(setup):
-    if not AI_KEY:
-        return ""
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json=dict(model="claude-sonnet-5-5", max_tokens=300, messages=[{
-                "role": "user",
-                "content": "راجع هذا الـ setup لاستراتيجية TS على الذهب باختصار (3 أسطر): "
-                           "القوة والخطر وتقييم من 10.\n" + json.dumps(setup, ensure_ascii=False)}]),
-            timeout=30)
-        return "\n\n🤖 مراجعة Claude:\n" + r.json()["content"][0]["text"]
-    except Exception:
-        return ""
-
+def pips(a, b):
+    return round(abs(a - b) * 10)
 
 def fmt(s):
-    arrow = "🔴 SELL" if s["dir"] == "sell" else "🟢 BUY"
-    tp2 = f"{s['tp2']:.2f}" if s["tp2"] is not None else "—"
-    return (f"{arrow} XAUUSD\n"
-            f"⏰ الشمعة الذهبية: {s['golden']} (NY)\n"
-            f"📍 المنطقة: {s['poi']}\n"
-            f"🎯 تأكيد: {s['kind']}\n"
-            f"➡️ الدخول: {s['entry']:.2f}\n"
-            f"🛑 الوقف: {s['sl']:.2f}\n"
-            f"✅ TP1: {s['tp1']:.2f} (RR {s['rr1']})\n"
-            f"✅ TP2: {tp2}\n"
-            f"📌 الحالة: {s['status']}\n"
-            f"Sweep: {s['sweep_time'][11:16]} | تأكيد: {s['confirm_time'][11:16]}")
+    t = pd.to_datetime(s["t"]) + timedelta(hours=1)
+    buy = s["side"] == "buy"
+    head = "🟢 BUY" if buy else "🔴 SELL"
+    tps = "\n".join(f"✅ TP{i+1}: {x} (+{pips(x, s['entry'])})" for i, x in enumerate(s["tps"]))
+    return (f"{head} XAUUSD (الآن)\n⏰ {t:%H:%M} (الجزائر)\n"
+            f"➡️ الدخول: {s['entry']}\n🛑 الوقف: {s['sl']} ({pips(s['entry'], s['sl'])} pip)\n{tps}\n"
+            f"📌 عند TP1: أغلق جزءاً وانقل الوقف إلى الدخول\n"
+            f"⚠️ لا تدخل إذا ابتعد السعر أكثر من 10 pip عن الدخول")
 
+MSG = {"TP1": "✅ TP1 تحقق — انقل الوقف إلى الدخول", "TP2": "✅ TP2 تحقق",
+       "TP3": "🏁 TP3 تحقق — اكتملت الصفقة", "SL": "❌ ضُرب الوقف",
+       "BE": "⚪ أُغلقت على نقطة الدخول"}
 
-def load_seen():
+# ---------------- live ----------------
+def load():
     try:
-        return set(json.load(open(SEEN_FILE)))
+        return json.load(open(STATE))
     except Exception:
-        return set()
+        return dict(open=None, day=None, n=0, sl=0, pnl=0.0, last_sig=None, cool=None)
 
+def live():
+    st = load()
+    now = datetime.now(timezone.utc)
+    df = fetch(300)
+    df = df[df.t + timedelta(minutes=BAR) <= now].reset_index(drop=True)
+    day = now.date().isoformat()
+    if st["day"] != day:
+        st.update(day=day, n=0, sl=0, pnl=0.0)
 
-def upcoming(now, mins=35):
-    for h, m in GOLD_TIMES:
-        st = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if now < st <= now + timedelta(minutes=mins):
-            return True
-    return False
+    s = st["open"]
+    if s:
+        since = pd.to_datetime(s["t"])
+        seen = pd.to_datetime(s["seen"]) if s.get("seen") else None
+        for _, b in df[df.t >= since].iterrows():
+            if seen is not None and b.t <= seen:
+                continue
+            s["seen"] = b.t.isoformat()
+            for e in step(s, b):
+                tg(f"{MSG[e]}\n({s['side'].upper()} @ {s['entry']})")
+            if s["closed"]:
+                break
+        if s["closed"]:
+            st["pnl"] += s["pnl"] - SPREAD
+            if s["stage"] == 0:
+                st["sl"] += 1
+            st["open"], st["cool"] = None, now.isoformat()
+        elif now - since > timedelta(hours=C["expire_h"]) and s["stage"] == 0:
+            tg(f"⏱ انتهت صلاحية الصفقة ({s['side'].upper()} @ {s['entry']}) — أغلقها يدوياً")
+            st["open"], st["cool"] = None, now.isoformat()
 
+    if not st["open"] and len(df):
+        last_t = df.t.iloc[-1] + timedelta(minutes=BAR)
+        fresh = now - last_t <= timedelta(minutes=STALE_MIN)
+        cool = st["cool"] and now - pd.to_datetime(st["cool"]) < timedelta(minutes=C["cool_min"])
+        blocked = (st["n"] >= C["max_signals"] or st["sl"] >= C["max_sl"]
+                   or st["pnl"] >= C["day_target"] or cool)
+        if fresh and not blocked:
+            sg = signal(df)
+            if sg and sg["t"] != st["last_sig"]:
+                tg(fmt(sg))
+                st["last_sig"] = sg["t"]
+                st["open"] = dict(sg, cur_sl=sg["sl"], stage=0, pnl=0.0, closed=False, seen=None)
+                st["n"] += 1
+    json.dump(st, open(STATE, "w"), indent=1)
 
-def main():
-    seen = load_seen()
-    one_shot = bool(os.getenv("ONE_SHOT"))
-    print("TS bot V2 started")
-    while True:
-        try:
-            now = pd.Timestamp.now(tz=NY)
-            busy = bool(active_starts(now))
-            if one_shot and not busy and not upcoming(now):
-                print("no window now, exiting")
-                return
-            if busy:
-                df1 = fetch_1m()
-                for s in scan(df1, now):
-                    key = f"{s['dir']}|{s['kind']}|{s['confirm_time']}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    json.dump(list(seen), open(SEEN_FILE, "w"))
-                    telegram(fmt(s) + ai_review(s))
-        except Exception as e:
-            print("error:", e)
-        time.sleep(POLL_SECONDS)
-
+# ---------------- backtest ----------------
+def backtest(pages=6):
+    parts, end = [], None
+    for _ in range(pages):
+        d = fetch(5000, end)
+        parts.append(d)
+        end = d.t.iloc[0].strftime("%Y-%m-%d %H:%M:%S")
+        time.sleep(9)
+    df = pd.concat(parts).drop_duplicates("t").sort_values("t").reset_index(drop=True)
+    tr, s, day, n, sl, pnl, cool = [], None, None, 0, 0, 0.0, None
+    for i in range(len(df)):
+        b = df.iloc[i]
+        if b.t.date() != day:
+            day, n, sl, pnl = b.t.date(), 0, 0, 0.0
+        if s:
+            step(s, b)
+            if s["closed"]:
+                net = s["pnl"] - SPREAD
+                pnl += net
+                sl += s["stage"] == 0
+                tr.append((s["t"], s["side"], round(net * 10)))
+                cool, s = b.t, None
+        if s is None:
+            if n >= C["max_signals"] or sl >= C["max_sl"] or pnl >= C["day_target"]:
+                continue
+            if cool is not None and b.t - cool < timedelta(minutes=C["cool_min"]):
+                continue
+            sg = signal(df.iloc[max(0, i - 120): i + 1])
+            if sg:
+                s = dict(sg, cur_sl=sg["sl"], stage=0, pnl=0.0, closed=False)
+                n += 1
+    if not tr:
+        return print("no trades")
+    p = [x[2] for x in tr]
+    w = [x for x in p if x > 0]
+    l = [x for x in p if x <= 0]
+    pf = sum(w) / abs(sum(l)) if l and sum(l) else float("inf")
+    eq = pd.Series(p).cumsum()
+    print(f"{df.t.iloc[0]:%Y-%m-%d} -> {df.t.iloc[-1]:%Y-%m-%d} | bars {len(df)}")
+    print(f"trades {len(p)} | win {len(w)/len(p):.0%} | total {sum(p)} pips | avg {sum(p)/len(p):.1f} | PF {pf:.2f}")
+    print(f"max drawdown {int((eq.cummax() - eq).max())} pips")
+    by = pd.Series(p, index=[pd.to_datetime(x[0]).hour for x in tr]).groupby(level=0).agg(["count", "sum"])
+    print("by UTC hour:\n", by)
 
 if __name__ == "__main__":
-    main()
-
+    m = sys.argv[1] if len(sys.argv) > 1 else "live"
+    if m == "live":
+        live()
+    elif m == "test":
+        tg("✅ البوت متصل")
+    elif m == "backtest":
+        backtest(int(sys.argv[2]) if len(sys.argv) > 2 else 6)
+name: Gold Pattern Bot
+on:
+  schedule:
+    - cron: "*/5 8-16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live | test | backtest"
+        default: "live"
+permissions:
+  contents: write
+concurrency:
+  group: gold-pattern
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas requests
+      - run: python gold_pattern_bot.py ${{ github.event.inputs.mode || 'live' }}
+        env:
+          TD_API_KEY: ${{ secrets.TD_API_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git commit -m "state" || exit 0
+          git push
