@@ -1,181 +1,478 @@
-"""
-Backtest لبوت TS V2 على بيانات XAU/USD التاريخية (TwelveData)
-"""
-import os, time
-import pandas as pd
+
+import os
+import time
 import requests
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+
 import ts_bot as bot
 
-DAYS = int(os.getenv("BT_DAYS") or "90")
-SPREAD = float(os.getenv("BT_SPREAD") or "0.4")
-HOLD_HOURS = 8
+
+# ================= CONFIG =================
+
+API_KEY = os.environ.get("TWELVEDATA_KEY", "")
+DAYS = int(os.environ.get("BT_DAYS", "90"))
+
+OUTPUT_FILE = "backtest_trades.csv"
+
+PAGE_SIZE = 5000
+REQUEST_DELAY = 0.3
+
+SPREAD = bot.SPREAD
+BAR_MINUTES = bot.BAR
 
 
-def download(days):
-    end = pd.Timestamp.now(tz=bot.NY).floor("min")
-    start = end - pd.Timedelta(days=days)
-    frames, cur = [], end
-    while cur > start:
-        params = dict(symbol=bot.SYMBOL, interval="1min", outputsize=5000,
-                      timezone="America/New_York",
-                      end_date=cur.strftime("%Y-%m-%d %H:%M:%S"), apikey=bot.TD_KEY)
-        j = None
-        for _ in range(4):
-            j = requests.get("https://api.twelvedata.com/time_series",
-                             params=params, timeout=30).json()
-            if "values" in j or j.get("code") != 429:
-                break
-            time.sleep(65)
-        if not j or "values" not in j:
-            print("توقف التحميل:", j)
+# ================= DATA DOWNLOAD =================
+
+def fetch_history(days):
+    if not API_KEY:
+        raise RuntimeError("TWELVEDATA_KEY is missing")
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=days)
+
+    cursor = end_time
+    pages = []
+    page_number = 0
+
+    print(f"Downloading {days} days of {bot.SYMBOL} data...")
+
+    while cursor > start_time:
+        params = {
+            "symbol": bot.SYMBOL,
+            "interval": bot.TF,
+            "outputsize": PAGE_SIZE,
+            "timezone": "UTC",
+            "end_date": cursor.strftime("%Y-%m-%d %H:%M:%S"),
+            "apikey": API_KEY,
+        }
+
+        response = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params=params,
+            timeout=60
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if "values" not in result:
+            raise RuntimeError(
+                f"TwelveData error: {result}"
+            )
+
+        page = pd.DataFrame(result["values"])
+
+        if page.empty:
             break
-        df = pd.DataFrame(j["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(
-            bot.NY, ambiguous="NaT", nonexistent="NaT")
-        df = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
-        frames.append(df)
-        print("حُمّل حتى", df.index[0])
-        if df.index[0] >= cur:
+
+        page["t"] = pd.to_datetime(
+            page["datetime"],
+            utc=True
+        )
+
+        for col in ("open", "high", "low", "close"):
+            page[col] = pd.to_numeric(
+                page[col],
+                errors="coerce"
+            )
+
+        page = page[
+            ["t", "open", "high", "low", "close"]
+        ].dropna()
+
+        if page.empty:
             break
-        cur = df.index[0] - pd.Timedelta(minutes=1)
-        time.sleep(8)
-    out = pd.concat(frames).sort_index()
-    out = out[~out.index.duplicated()]
-    return out[["open", "high", "low", "close"]].astype(float).loc[start:]
+
+        pages.append(page)
+
+        oldest = page["t"].min()
+        page_number += 1
+
+        print(
+            f"Page {page_number}: "
+            f"{len(page)} candles | oldest: {oldest}"
+        )
+
+        if oldest <= start_time:
+            break
+
+        next_cursor = oldest.to_pydatetime() - timedelta(seconds=1)
+
+        if next_cursor >= cursor:
+            break
+
+        cursor = next_cursor
+        time.sleep(REQUEST_DELAY)
+
+    if not pages:
+        raise RuntimeError("No historical candles downloaded")
+
+    df = pd.concat(pages, ignore_index=True)
+
+    df = (
+        df.drop_duplicates(subset=["t"])
+        .sort_values("t")
+        .reset_index(drop=True)
+    )
+
+    df = df[
+        (df["t"] >= start_time)
+        & (df["t"] <= end_time)
+    ].reset_index(drop=True)
+
+    if len(df) < 100:
+        raise RuntimeError(
+            f"Not enough candles: {len(df)}"
+        )
+
+    print(f"\nTotal candles: {len(df)}")
+    print(f"From: {df.t.iloc[0]}")
+    print(f"To:   {df.t.iloc[-1]}")
+
+    return df
 
 
-def finish_bt(df3, j, e, entry, ext, lows, kind):
-    sl = ext + bot.SL_BUFFER
-    risk = sl - entry
-    if risk <= 0:
-        return None
-    tp1, tp2 = bot.pick_targets(entry, risk, lows)
-    if tp1 is None:
-        return None
-    return dict(kind=kind, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                rr1=round((entry - tp1) / risk, 2),
-                sweep_time=str(df3.index[e]), confirm_time=str(df3.index[j]),
-                status="bt", t_confirm=df3.index[j])
+# ================= TRADE SIMULATION =================
+
+def new_trade(signal):
+    return {
+        **signal,
+        "cur_sl": signal["sl"],
+        "stage": 0,
+        "pnl": 0.0,
+        "closed": False,
+        "seen": None,
+    }
 
 
-bot.finish = finish_bt
+def simulate_trade(trade, candle):
+    events = bot.step(trade, candle)
+
+    if not trade["closed"]:
+        return events, None
+
+    if trade["stage"] == 3:
+        exit_price = trade["tps"][2]
+        reason = "TP3"
+
+    elif trade["stage"] == 0:
+        exit_price = trade["sl"]
+        reason = "SL"
+
+    else:
+        exit_price = trade["entry"]
+        reason = "BE"
+
+    return events, {
+        "exit_price": exit_price,
+        "reason": reason,
+    }
 
 
-def sim_sell(entry, sl, tp1, tp2, bars):
-    risk = sl - entry
-    hi, lo, cl = (bars[c].to_numpy() for c in ("high", "low", "close"))
-    n = len(hi)
-    i = 0
-    while i < n and hi[i] < entry:
-        if lo[i] <= tp1:
-            return "MISSED", 0.0, 0.0
-        i += 1
-    if i >= n:
-        return "NOFILL", 0.0, 0.0
-    if hi[i] >= sl:
-        return "LOSS", -1.0, -1.0
-    end = min(n, i + 1 + HOLD_HOURS * 60)
-    rr1 = (entry - tp1) / risk
-    rr2 = (entry - tp2) / risk if tp2 is not None else None
-    k = i + 1
-    while k < end:
-        if hi[k] >= sl:
-            return "LOSS", -1.0, -1.0
-        if lo[k] <= tp1:
-            if tp2 is None:
-                return "WIN", rr1, rr1
-            m = k
-            while m < end:
-                if m > k and hi[m] >= sl:
-                    return "WIN", rr1, 0.5 * rr1 - 0.5
-                if lo[m] <= tp2:
-                    return "WIN", rr1, 0.5 * rr1 + 0.5 * rr2
-                m += 1
-            last = (entry - cl[end - 1]) / risk
-            return "WIN", rr1, 0.5 * rr1 + 0.5 * last
-        k += 1
-    last = (entry - cl[end - 1]) / risk
-    return "TIMEOUT", last, last
+def expire_trade(trade, candle):
+    """
+    انتهاء 3 ساعات:
+    إغلاق الجزء المتبقي عند إغلاق آخر شمعة.
+    """
+
+    buy = trade["side"] == "buy"
+    direction = 1 if buy else -1
+
+    remaining = (3 - trade["stage"]) / 3
+
+    trade["pnl"] += (
+        remaining
+        * direction
+        * (float(candle.close) - trade["entry"])
+    )
+
+    trade["closed"] = True
+
+    return {
+        "exit_price": float(candle.close),
+        "reason": "EXPIRED",
+    }
 
 
-def run(df1):
-    mdf = bot.mirror(df1)
-    days = pd.bdate_range(df1.index[0].date(), df1.index[-1].date())
-    trades, seen = [], set()
-    for d in days:
-        for h, m in bot.GOLD_TIMES:
-            now = pd.Timestamp(d.year, d.month, d.day, h, m, tz=bot.NY) + pd.Timedelta(minutes=59)
-            pos = df1.index.searchsorted(now)
-            if pos < 3000:
-                continue
-            sub = df1.iloc[max(0, pos - 5000):pos]
-            if sub.index[-1] < now - pd.Timedelta(minutes=10):
-                continue
-            for s in bot.scan(sub, now):
-                key = (s["dir"], s["kind"], s["confirm_time"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                trades.append(s)
+# ================= RESULTS =================
 
-    for t in trades:
-        sell = t["dir"] == "sell"
-        tc = t["t_confirm"] + pd.Timedelta(minutes=3)
-        src = df1 if sell else mdf
-        bars = src.loc[tc: tc + pd.Timedelta(hours=HOLD_HOURS + 24)]
-        sg = 1 if sell else -1
-        entry, sl, tp1 = sg * t["entry"], sg * t["sl"], sg * t["tp1"]
-        tp2 = sg * t["tp2"] if t["tp2"] is not None else None
-        res, ra, rb = sim_sell(entry, sl, tp1, tp2, bars)
-        if res in ("WIN", "LOSS", "TIMEOUT"):
-            cost = SPREAD / (sl - entry)
-            ra, rb = ra - cost, rb - cost
-        t.update(res=res, ra=ra, rb=rb)
-    return trades
+def make_record(trade, result, close_time):
+    gross = float(trade["pnl"])
+    net = gross - SPREAD
+
+    return {
+        "entry_time": trade["t"],
+        "exit_time": close_time.isoformat(),
+        "side": trade["side"].upper(),
+        "entry": trade["entry"],
+        "initial_sl": trade["sl"],
+        "tp1": trade["tps"][0],
+        "tp2": trade["tps"][1],
+        "tp3": trade["tps"][2],
+        "exit_price": result["exit_price"],
+        "exit_reason": result["reason"],
+        "stage": trade["stage"],
+        "gross_pnl": round(gross, 3),
+        "spread": SPREAD,
+        "net_pnl": round(net, 3),
+        "risk": round(
+            abs(trade["entry"] - trade["sl"]), 3
+        ),
+    }
 
 
-def stats(ts, label):
-    f = [t for t in ts if t["res"] in ("WIN", "LOSS", "TIMEOUT")]
-    if not f:
-        return f"{label}: لا صفقات"
-    w = sum(t["res"] == "WIN" for t in f)
-    l = sum(t["res"] == "LOSS" for t in f)
-    to = sum(t["res"] == "TIMEOUT" for t in f)
-    out = [f"{label}: صفقات منفذة {len(f)} | ربح(TP1) {w} | خسارة {l} | مهلة {to} | نسبة النجاح {100*w/len(f):.0f}%"]
-    for name, key in (("خروج كامل عند TP1", "ra"), ("50% TP1 + 50% TP2", "rb")):
-        r = [t[key] for t in sorted(f, key=lambda x: x["t_confirm"])]
-        gp = sum(x for x in r if x > 0)
-        gl = -sum(x for x in r if x < 0)
-        cum, peak, dd = 0.0, 0.0, 0.0
-        for x in r:
-            cum += x
-            peak = max(peak, cum)
-            dd = max(dd, peak - cum)
-        pf = gp / gl if gl else float("inf")
-        out.append(f"  {name}: مجموع {sum(r):+.1f}R | متوسط {sum(r)/len(r):+.2f}R | PF {pf:.2f} | أقصى تراجع {dd:.1f}R")
-    return "\n".join(out)
+def report(records, candles):
+    if not records:
+        print("\nNo completed trades.")
+        return
+
+    df = pd.DataFrame(records)
+
+    total = len(df)
+
+    wins = int((df.net_pnl > 0).sum())
+    losses = int((df.net_pnl < 0).sum())
+    breakeven = total - wins - losses
+
+    net_profit = float(df.net_pnl.sum())
+
+    gross_profit = float(
+        df.loc[df.net_pnl > 0, "net_pnl"].sum()
+    )
+
+    gross_loss = abs(float(
+        df.loc[df.net_pnl < 0, "net_pnl"].sum()
+    ))
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0 else float("inf")
+    )
+
+    win_rate = wins / total * 100
+
+    avg_trade = net_profit / total
+
+    df["cumulative_pnl"] = df.net_pnl.cumsum()
+
+    df["equity_peak"] = (
+        df["cumulative_pnl"].cummax()
+    )
+
+    df["drawdown"] = (
+        df["cumulative_pnl"] - df["equity_peak"]
+    )
+
+    max_drawdown = abs(float(df.drawdown.min()))
+
+    risk_values = df["risk"].replace(0, pd.NA)
+
+    df["R"] = df["net_pnl"] / risk_values
+
+    avg_r = float(df["R"].dropna().mean())
+
+    print("\n" + "=" * 45)
+    print("TS BOT BACKTEST RESULTS")
+    print("=" * 45)
+
+    print(f"Candles:          {len(candles)}")
+    print(f"Total trades:     {total}")
+    print(f"Wins:             {wins}")
+    print(f"Losses:           {losses}")
+    print(f"Breakeven:        {breakeven}")
+    print(f"Win rate:         {win_rate:.2f}%")
+    print(f"Net PnL:          {net_profit:.2f}")
+    print(f"Gross profit:     {gross_profit:.2f}")
+    print(f"Gross loss:       {gross_loss:.2f}")
+    print(f"Profit factor:    {profit_factor:.2f}")
+    print(f"Average trade:    {avg_trade:.2f}")
+    print(f"Average R:        {avg_r:.3f}")
+    print(f"Max drawdown:     {max_drawdown:.2f}")
+
+    print("\nExit reasons:")
+
+    for reason, count in df.exit_reason.value_counts().items():
+        print(f"{reason}: {count}")
+
+    print("\nBy direction:")
+
+    for side, group in df.groupby("side"):
+        print(
+            f"{side}: "
+            f"{len(group)} trades | "
+            f"PnL: {group.net_pnl.sum():.2f} | "
+            f"Win rate: "
+            f"{(group.net_pnl > 0).mean() * 100:.2f}%"
+        )
+
+    df.to_csv(OUTPUT_FILE, index=False)
+
+    print(f"\nCSV saved: {OUTPUT_FILE}")
 
 
-def report(trades):
-    miss = sum(t["res"] in ("MISSED", "NOFILL") for t in trades)
-    lines = [f"📊 Backtest آخر {DAYS} يوماً (spread {SPREAD}$)",
-             f"إشارات: {len(trades)} | لم تُنفَّذ (وصل TP1 قبل الدخول أو لم يلمس السعر): {miss}", ""]
-    lines.append(stats(trades, "الكل"))
-    for k in sorted({t["kind"] for t in trades}):
-        lines.append(stats([t for t in trades if t["kind"] == k], k))
-    for d in ("sell", "buy"):
-        lines.append(stats([t for t in trades if t["dir"] == d], d))
-    lines.append("")
-    lines.append("تنبيه: النتائج تعتمد على تعريفاتي للـ CISD/MSS/FVG وعلى بيانات TwelveData، وهي ليست ضماناً.")
-    return "\n".join(lines)
+# ================= BACKTEST ENGINE =================
 
+def run_backtest():
+    candles = fetch_history(DAYS)
+
+    warmup = (
+        bot.C["lookback"]
+        + bot.C["sweep_win"]
+        + bot.C["atr_n"]
+        + 5
+    )
+
+    if len(candles) <= warmup:
+        raise RuntimeError("Not enough candles for strategy warmup")
+
+    records = []
+
+    active = None
+    cooldown_until = None
+
+    daily = {}
+
+    print("\nRunning TS bot strategy...")
+
+    for i in range(warmup, len(candles)):
+        candle = candles.iloc[i]
+        candle_time = candle.t.to_pydatetime()
+
+        day = candle_time.date().isoformat()
+
+        if day not in daily:
+            daily[day] = {
+                "signals": 0,
+                "sl": 0,
+                "pnl": 0.0,
+            }
+
+        stats = daily[day]
+
+        # -------- Manage open trade --------
+
+        if active is not None:
+            entry_time = pd.to_datetime(active["t"]).to_pydatetime()
+
+            if candle_time >= entry_time:
+                events, result = simulate_trade(
+                    active,
+                    candle
+                )
+
+                if result is not None:
+                    record = make_record(
+                        active,
+                        result,
+                        candle_time
+                    )
+
+                    records.append(record)
+
+                    stats["pnl"] += record["net_pnl"]
+
+                    if result["reason"] == "SL":
+                        stats["sl"] += 1
+
+                    cooldown_until = (
+                        candle_time
+                        + timedelta(minutes=bot.C["cool_min"])
+                    )
+
+                    active = None
+
+            # -------- Expiration --------
+
+            if active is not None:
+                elapsed = candle_time - entry_time
+
+                if (
+                    elapsed >= timedelta(hours=bot.C["expire_h"])
+                    and active["stage"] == 0
+                ):
+                    result = expire_trade(active, candle)
+
+                    record = make_record(
+                        active,
+                        result,
+                        candle_time
+                    )
+
+                    records.append(record)
+
+                    stats["pnl"] += record["net_pnl"]
+
+                    cooldown_until = (
+                        candle_time
+                        + timedelta(minutes=bot.C["cool_min"])
+                    )
+
+                    active = None
+
+        # -------- New signal --------
+
+        if active is not None:
+            continue
+
+        if not bot.in_session(candle_time + timedelta(minutes=BAR_MINUTES)):
+            continue
+
+        if stats["signals"] >= bot.C["max_signals"]:
+            continue
+
+        if stats["sl"] >= bot.C["max_sl"]:
+            continue
+
+        if stats["pnl"] >= bot.C["day_target"]:
+            continue
+
+        if (
+            cooldown_until is not None
+            and candle_time < cooldown_until
+        ):
+            continue
+
+        window = candles.iloc[:i + 1].copy()
+
+        signal = bot.signal(window)
+
+        if signal is None:
+            continue
+
+        active = new_trade(signal)
+        stats["signals"] += 1
+
+        print(
+            f"[SIGNAL] {signal['side'].upper()} "
+            f"@ {signal['entry']} | "
+            f"{signal['t']}"
+        )
+
+    # -------- Close remaining open trade --------
+
+    if active is not None:
+        last_candle = candles.iloc[-1]
+
+        result = expire_trade(
+            active,
+            last_candle
+        )
+
+        result["reason"] = "END_OF_DATA"
+
+        records.append(
+            make_record(
+                active,
+                result,
+                last_candle.t.to_pydatetime()
+            )
+        )
+
+    report(records, candles)
+
+
+# ================= MAIN =================
 
 if __name__ == "__main__":
-    data = download(DAYS)
-    print("شموع:", len(data), data.index[0], "->", data.index[-1])
-    tr = run(data)
-    txt = report(tr)
-    print(txt)
-    pd.DataFrame([{k: v for k, v in t.items() if k != "t_confirm"} for t in tr]).to_csv("trades.csv", index=False)
-    if bot.TG_TOKEN and bot.TG_CHAT:
-        bot.telegram(txt)
+    run_backtest()
