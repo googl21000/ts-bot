@@ -1,3 +1,4 @@
+
 import os, sys, json, time, requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -5,13 +6,14 @@ from datetime import datetime, timezone, timedelta
 TD_KEY = os.environ.get("TD_API_KEY", "")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
+
 SYMBOL, TF, BAR = "XAU/USD", "5min", 5
 STATE = "state.json"
-SPREAD = 0.9      # دولار
-STALE_MIN = 10    # لا ترسل إشارة متأخرة أكثر من هذا
+SPREAD = 0.9
+STALE_MIN = 10
 
 C = dict(
-    sess=(8 * 60, 13 * 60 + 30),   # UTC = 09:00-14:30 الجزائر
+    sess=(8 * 60, 13 * 60 + 30),
     lookback=36, sweep_win=6, atr_n=14, body_atr=0.5,
     buffer=0.5, min_risk=2.0, max_risk=6.0,
     tp=(5.0, 10.0, 18.0),
@@ -19,30 +21,38 @@ C = dict(
     cool_min=15, expire_h=3,
 )
 
-# ---------------- data ----------------
 def fetch(n=300, end=None):
-    p = dict(symbol=SYMBOL, interval=TF, outputsize=n, timezone="UTC", apikey=TD_KEY)
+    p = dict(symbol=SYMBOL, interval=TF, outputsize=n,
+             timezone="UTC", apikey=TD_KEY)
     if end:
         p["end_date"] = end
-    r = requests.get("https://api.twelvedata.com/time_series", params=p, timeout=30).json()
+    r = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params=p, timeout=30
+    ).json()
     if "values" not in r:
         raise RuntimeError(r)
     df = pd.DataFrame(r["values"])
     df["t"] = pd.to_datetime(df["datetime"], utc=True)
     for c in ("open", "high", "low", "close"):
         df[c] = df[c].astype(float)
-    return df[["t", "open", "high", "low", "close"]].sort_values("t").reset_index(drop=True)
+    return df[["t", "open", "high", "low", "close"]].sort_values(
+        "t"
+    ).reset_index(drop=True)
 
 def atr(df, n):
     pc = df.close.shift()
-    tr = pd.concat([df.high - df.low, (df.high - pc).abs(), (df.low - pc).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        df.high - df.low,
+        (df.high - pc).abs(),
+        (df.low - pc).abs()
+    ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
 def in_session(t):
     m = t.hour * 60 + t.minute
     return t.weekday() < 5 and C["sess"][0] <= m < C["sess"][1]
 
-# ---------------- strategy ----------------
 def signal(df):
     n = C["lookback"] + C["sweep_win"]
     if len(df) < n + 2:
@@ -76,12 +86,17 @@ def signal(df):
         if risk > C["max_risk"]:
             continue
         d = 1 if buy else -1
-        return dict(side="buy" if buy else "sell", entry=round(e, 2), sl=round(sl, 2),
-                    tps=[round(e + d * x, 2) for x in C["tp"]], t=t_in.isoformat())
+        return dict(
+            side="buy" if buy else "sell",
+            entry=round(e, 2),
+            sl=round(sl, 2),
+            tps=[round(e + d * x, 2) for x in C["tp"]],
+            t=t_in.isoformat()
+        )
     return None
 
 def step(s, b):
-‎    """يحدّث الصفقة بشمعة واحدة. الوقف أولاً عند التعارض داخل الشمعة."""
+    """Updates a trade with one candle. SL is checked first on same-candle conflict."""
     ev = []
     buy = s["side"] == "buy"
     d = 1 if buy else -1
@@ -104,12 +119,14 @@ def step(s, b):
         s["closed"] = True
     return ev
 
-# ---------------- telegram ----------------
 def tg(msg):
     print(msg)
     if TG_TOKEN:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": msg}, timeout=30)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg},
+            timeout=30
+        )
 
 def pips(a, b):
     return round(abs(a - b) * 10)
@@ -118,28 +135,44 @@ def fmt(s):
     t = pd.to_datetime(s["t"]) + timedelta(hours=1)
     buy = s["side"] == "buy"
     head = "🟢 BUY" if buy else "🔴 SELL"
-    tps = "\n".join(f"✅ TP{i+1}: {x} (+{pips(x, s['entry'])})" for i, x in enumerate(s["tps"]))
-    return (f"{head} XAUUSD (الآن)\n⏰ {t:%H:%M} (الجزائر)\n"
-            f"➡️ الدخول: {s['entry']}\n🛑 الوقف: {s['sl']} ({pips(s['entry'], s['sl'])} pip)\n{tps}\n"
-            f"📌 عند TP1: أغلق جزءاً وانقل الوقف إلى الدخول\n"
-            f"⚠️ لا تدخل إذا ابتعد السعر أكثر من 10 pip عن الدخول")
+    tps = "\n".join(
+        f"✅ TP{i+1}: {x} (+{pips(x, s['entry'])})"
+        for i, x in enumerate(s["tps"])
+    )
+    return (
+        f"{head} XAUUSD (الآن)\n⏰ {t:%H:%M} (الجزائر)\n"
+        f"➡️ الدخول: {s['entry']}\n"
+        f"🛑 الوقف: {s['sl']} ({pips(s['entry'], s['sl'])} pip)\n"
+        f"{tps}\n"
+        f"📌 عند TP1: أغلق جزءاً وانقل الوقف إلى الدخول\n"
+        f"⚠️ لا تدخل إذا ابتعد السعر أكثر من 10 pip عن الدخول"
+    )
 
-MSG = {"TP1": "✅ TP1 تحقق — انقل الوقف إلى الدخول", "TP2": "✅ TP2 تحقق",
-       "TP3": "🏁 TP3 تحقق — اكتملت الصفقة", "SL": "❌ ضُرب الوقف",
-       "BE": "⚪ أُغلقت على نقطة الدخول"}
+MSG = {
+    "TP1": "✅ TP1 تحقق — انقل الوقف إلى الدخول",
+    "TP2": "✅ TP2 تحقق",
+    "TP3": "🏁 TP3 تحقق — اكتملت الصفقة",
+    "SL": "❌ ضُرب الوقف",
+    "BE": "⚪ أُغلقت على نقطة الدخول"
+}
 
-# ---------------- live ----------------
 def load():
     try:
         return json.load(open(STATE))
     except Exception:
-        return dict(open=None, day=None, n=0, sl=0, pnl=0.0, last_sig=None, cool=None)
+        return dict(
+            open=None, day=None, n=0, sl=0,
+            pnl=0.0, last_sig=None, cool=None
+        )
 
 def live():
     st = load()
     now = datetime.now(timezone.utc)
     df = fetch(300)
-    df = df[df.t + timedelta(minutes=BAR) <= now].reset_index(drop=True)
+    df = df[
+        df.t + timedelta(minutes=BAR) <= now
+    ].reset_index(drop=True)
+
     day = now.date().isoformat()
     if st["day"] != day:
         st.update(day=day, n=0, sl=0, pnl=0.0)
@@ -169,18 +202,25 @@ def live():
         last_t = df.t.iloc[-1] + timedelta(minutes=BAR)
         fresh = now - last_t <= timedelta(minutes=STALE_MIN)
         cool = st["cool"] and now - pd.to_datetime(st["cool"]) < timedelta(minutes=C["cool_min"])
-        blocked = (st["n"] >= C["max_signals"] or st["sl"] >= C["max_sl"]
-                   or st["pnl"] >= C["day_target"] or cool)
+        blocked = (
+            st["n"] >= C["max_signals"]
+            or st["sl"] >= C["max_sl"]
+            or st["pnl"] >= C["day_target"]
+            or cool
+        )
         if fresh and not blocked:
             sg = signal(df)
             if sg and sg["t"] != st["last_sig"]:
                 tg(fmt(sg))
                 st["last_sig"] = sg["t"]
-                st["open"] = dict(sg, cur_sl=sg["sl"], stage=0, pnl=0.0, closed=False, seen=None)
+                st["open"] = dict(
+                    sg, cur_sl=sg["sl"], stage=0,
+                    pnl=0.0, closed=False, seen=None
+                )
                 st["n"] += 1
+
     json.dump(st, open(STATE, "w"), indent=1)
 
-# ---------------- backtest ----------------
 def backtest(pages=6):
     parts, end = [], None
     for _ in range(pages):
@@ -188,12 +228,18 @@ def backtest(pages=6):
         parts.append(d)
         end = d.t.iloc[0].strftime("%Y-%m-%d %H:%M:%S")
         time.sleep(9)
-    df = pd.concat(parts).drop_duplicates("t").sort_values("t").reset_index(drop=True)
+
+    df = pd.concat(parts).drop_duplicates("t").sort_values(
+        "t"
+    ).reset_index(drop=True)
+
     tr, s, day, n, sl, pnl, cool = [], None, None, 0, 0, 0.0, None
+
     for i in range(len(df)):
         b = df.iloc[i]
         if b.t.date() != day:
             day, n, sl, pnl = b.t.date(), 0, 0, 0.0
+
         if s:
             step(s, b)
             if s["closed"]:
@@ -202,6 +248,7 @@ def backtest(pages=6):
                 sl += s["stage"] == 0
                 tr.append((s["t"], s["side"], round(net * 10)))
                 cool, s = b.t, None
+
         if s is None:
             if n >= C["max_signals"] or sl >= C["max_sl"] or pnl >= C["day_target"]:
                 continue
@@ -209,19 +256,35 @@ def backtest(pages=6):
                 continue
             sg = signal(df.iloc[max(0, i - 120): i + 1])
             if sg:
-                s = dict(sg, cur_sl=sg["sl"], stage=0, pnl=0.0, closed=False)
+                s = dict(
+                    sg, cur_sl=sg["sl"], stage=0,
+                    pnl=0.0, closed=False
+                )
                 n += 1
+
     if not tr:
         return print("no trades")
+
     p = [x[2] for x in tr]
     w = [x for x in p if x > 0]
     l = [x for x in p if x <= 0]
     pf = sum(w) / abs(sum(l)) if l and sum(l) else float("inf")
     eq = pd.Series(p).cumsum()
-    print(f"{df.t.iloc[0]:%Y-%m-%d} -> {df.t.iloc[-1]:%Y-%m-%d} | bars {len(df)}")
-    print(f"trades {len(p)} | win {len(w)/len(p):.0%} | total {sum(p)} pips | avg {sum(p)/len(p):.1f} | PF {pf:.2f}")
-    print(f"max drawdown {int((eq.cummax() - eq).max())} pips")
-    by = pd.Series(p, index=[pd.to_datetime(x[0]).hour for x in tr]).groupby(level=0).agg(["count", "sum"])
+
+    print(
+        f"{df.t.iloc[0]:%Y-%m-%d} -> {df.t.iloc[-1]:%Y-%m-%d} | bars {len(df)}"
+    )
+    print(
+        f"trades {len(p)} | win {len(w)/len(p):.0%} | "
+        f"total {sum(p)} pips | avg {sum(p)/len(p):.1f} | PF {pf:.2f}"
+    )
+    print(
+        f"max drawdown {int((eq.cummax() - eq).max())} pips"
+    )
+    by = pd.Series(
+        p,
+        index=[pd.to_datetime(x[0]).hour for x in tr]
+    ).groupby(level=0).agg(["count", "sum"])
     print("by UTC hour:\n", by)
 
 if __name__ == "__main__":
@@ -232,36 +295,3 @@ if __name__ == "__main__":
         tg("✅ البوت متصل")
     elif m == "backtest":
         backtest(int(sys.argv[2]) if len(sys.argv) > 2 else 6)
-name: Gold Pattern Bot
-on:
-  schedule:
-    - cron: "*/5 8-16 * * 1-5"
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "live | test | backtest"
-        default: "live"
-permissions:
-  contents: write
-concurrency:
-  group: gold-pattern
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install pandas requests
-      - run: python gold_pattern_bot.py ${{ github.event.inputs.mode || 'live' }}
-        env:
-          TD_API_KEY: ${{ secrets.TD_API_KEY }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      - run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add state.json || true
-          git commit -m "state" || exit 0
-          git push
