@@ -4,837 +4,466 @@ import time
 import requests
 import pandas as pd
 
-from datetime import datetime, timezone, timedelta
-
+from datetime import datetime, timedelta, timezone
 import ts_bot as bot
 
 
 # ==================================================
-# CONFIGURATION
+# TS BOT BACKTEST CONFIG
 # ==================================================
 
-API_KEY = os.environ.get("TWELVEDATA_KEY", "")
+BT_DAYS = int(os.environ.get("BT_DAYS", "90"))
+
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
 
-DAYS = int(os.environ.get("BT_DAYS", "90"))
-
-OUTPUT_FILE = "backtest_trades.csv"
-
-PAGE_SIZE = 5000
-REQUEST_DELAY = 0.4
-
 SPREAD = bot.SPREAD
-BAR_MINUTES = bot.BAR
+BAR = bot.BAR
+
+CSV_FILE = "backtest_trades.csv"
 
 
 # ==================================================
 # TELEGRAM
 # ==================================================
 
-def send_telegram(message):
+def telegram_message(message):
     if not TG_TOKEN or not TG_CHAT:
-        raise RuntimeError(
-            "Missing TG_TOKEN or TG_CHAT GitHub Secrets"
-        )
+        return
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TG_TOKEN}/sendMessage"
-    )
-
-    # Telegram message limit is 4096 characters.
-    chunks = [
-        message[i:i + 3900]
-        for i in range(0, len(message), 3900)
-    ]
-
-    for chunk in chunks:
-        response = requests.post(
-            url,
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={
                 "chat_id": TG_CHAT,
-                "text": chunk
+                "text": message
             },
             timeout=30
-        )
+        ).raise_for_status()
 
-        response.raise_for_status()
-
-        result = response.json()
-
-        if not result.get("ok"):
-            raise RuntimeError(
-                f"Telegram sendMessage failed: {result}"
-            )
-
-    print("Telegram report sent successfully")
+    except Exception as error:
+        print("Telegram message error:", error)
 
 
-def send_csv_to_telegram():
-    if not os.path.exists(OUTPUT_FILE):
-        raise RuntimeError("CSV file was not created")
+def telegram_file(filename):
+    if not TG_TOKEN or not TG_CHAT:
+        return
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TG_TOKEN}/sendDocument"
-    )
+    try:
+        with open(filename, "rb") as file:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                data={"chat_id": TG_CHAT},
+                files={"document": file},
+                timeout=60
+            ).raise_for_status()
 
-    with open(OUTPUT_FILE, "rb") as file:
-        response = requests.post(
-            url,
-            data={"chat_id": TG_CHAT},
-            files={"document": (OUTPUT_FILE, file)},
-            timeout=60
-        )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram sendDocument failed: {result}"
-        )
-
-    print("CSV sent to Telegram successfully")
+    except Exception as error:
+        print("Telegram file error:", error)
 
 
 # ==================================================
-# HISTORICAL DATA
+# DOWNLOAD HISTORICAL DATA
 # ==================================================
 
-def fetch_history(days):
-    if not API_KEY:
-        raise RuntimeError("TWELVEDATA_KEY is missing")
+def download_history(days):
 
-    end_time = datetime.now(timezone.utc)
+    if days <= 0:
+        raise ValueError("BT_DAYS must be greater than zero")
 
-    start_time = end_time - timedelta(days=days)
+    end = None
+    parts = []
 
-    cursor = end_time
-    pages = []
+    now = datetime.now(timezone.utc)
+    start_date = now - timedelta(days=days)
 
-    page_number = 0
+    # حوالي 288 شمعة في اليوم على إطار 5 دقائق
+    max_pages = max(2, int(days * 288 / 4500) + 3)
 
-    print(
-        f"Downloading {days} days "
-        f"of {bot.SYMBOL} data..."
-    )
+    print(f"Downloading last {days} days...")
 
-    while cursor > start_time:
+    previous_oldest = None
 
-        params = {
-            "symbol": bot.SYMBOL,
-            "interval": bot.TF,
-            "outputsize": PAGE_SIZE,
-            "timezone": "UTC",
-            "end_date": cursor.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "apikey": API_KEY
-        }
+    for page in range(max_pages):
 
-        response = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params=params,
-            timeout=60
-        )
+        print(f"Downloading page {page + 1}/{max_pages}")
 
-        response.raise_for_status()
+        data = bot.fetch(5000, end)
 
-        result = response.json()
-
-        if "values" not in result:
-            raise RuntimeError(
-                f"TwelveData error: {result}"
-            )
-
-        page = pd.DataFrame(result["values"])
-
-        if page.empty:
+        if data is None or data.empty:
+            print("No more candles available.")
             break
 
-        page["t"] = pd.to_datetime(
-            page["datetime"],
-            utc=True
-        )
+        oldest = data["t"].min()
 
-        for col in ("open", "high", "low", "close"):
-            page[col] = pd.to_numeric(
-                page[col],
-                errors="coerce"
-            )
-
-        page = page[
-            ["t", "open", "high", "low", "close"]
-        ].dropna()
-
-        if page.empty:
+        if previous_oldest is not None and oldest >= previous_oldest:
+            print("Pagination stopped: no older candles returned.")
             break
 
-        pages.append(page)
+        parts.append(data)
+        previous_oldest = oldest
 
-        oldest = page["t"].min()
-
-        page_number += 1
-
-        print(
-            f"Page {page_number}: "
-            f"{len(page)} candles | "
-            f"oldest: {oldest}"
-        )
-
-        if oldest <= start_time:
+        if oldest <= pd.Timestamp(start_date):
             break
 
-        next_cursor = (
-            oldest.to_pydatetime()
-            - timedelta(seconds=1)
-        )
+        end = (
+            oldest - timedelta(minutes=BAR)
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
-        if next_cursor >= cursor:
-            break
+        time.sleep(9)
 
-        cursor = next_cursor
-
-        time.sleep(REQUEST_DELAY)
-
-    if not pages:
-        raise RuntimeError(
-            "No historical candles downloaded"
-        )
-
-    df = pd.concat(
-        pages,
-        ignore_index=True
-    )
+    if not parts:
+        raise RuntimeError("No historical candles downloaded")
 
     df = (
-        df.drop_duplicates(subset=["t"])
+        pd.concat(parts)
+        .drop_duplicates(subset=["t"])
         .sort_values("t")
         .reset_index(drop=True)
     )
 
-    # Keep requested period only.
     df = df[
-        (df["t"] >= start_time)
-        & (df["t"] <= end_time)
+        (df["t"] >= pd.Timestamp(start_date))
+        & (df["t"] <= pd.Timestamp(now))
     ].reset_index(drop=True)
 
-    # Remove candles that have not closed yet.
-    df = df[
-        df["t"] + timedelta(minutes=BAR_MINUTES)
-        <= end_time
-    ].reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError("No candles inside requested date range")
 
-    if len(df) < 100:
-        raise RuntimeError(
-            f"Not enough candles: {len(df)}"
-        )
-
-    print("\nHistorical data downloaded")
+    print(
+        f"History: {df.t.iloc[0]} -> {df.t.iloc[-1]}"
+    )
     print(f"Total candles: {len(df)}")
-    print(f"From: {df.t.iloc[0]}")
-    print(f"To:   {df.t.iloc[-1]}")
 
     return df
 
 
 # ==================================================
-# TRADE CREATION
+# SIMULATION
 # ==================================================
 
-def new_trade(signal):
-    return {
-        **signal,
-        "cur_sl": signal["sl"],
-        "stage": 0,
-        "pnl": 0.0,
-        "closed": False,
-        "seen": None
-    }
+def simulate(df):
 
+    trades = []
 
-# ==================================================
-# TRADE SIMULATION
-# ==================================================
+    active = None
 
-def simulate_trade(trade, candle):
+    current_day = None
+    daily_signals = 0
+    daily_sl = 0
+    daily_pnl = 0.0
 
-    # Use the exact step function from ts_bot.py.
-    events = bot.step(trade, candle)
+    cooldown = None
 
-    if not trade["closed"]:
-        return events, None
+    for i in range(len(df)):
 
-    if trade["stage"] == 3:
+        candle = df.iloc[i]
 
-        exit_price = trade["tps"][2]
-        reason = "TP3"
+        # Reset daily limits using UTC date
+        if candle.t.date() != current_day:
 
-    elif trade["stage"] == 0:
+            current_day = candle.t.date()
 
-        exit_price = trade["sl"]
-        reason = "SL"
+            daily_signals = 0
+            daily_sl = 0
+            daily_pnl = 0.0
 
-    else:
+        # ------------------------------------------
+        # Manage existing trade
+        # ------------------------------------------
 
-        exit_price = trade["entry"]
-        reason = "BE"
+        if active is not None:
 
-    return events, {
-        "exit_price": exit_price,
-        "reason": reason
-    }
+            bot.step(active, candle)
 
+            # Trade closed by strategy
+            if active["closed"]:
 
-def expire_trade(trade, candle):
+                gross = active["pnl"]
+                net = gross - SPREAD
 
-    buy = trade["side"] == "buy"
+                if active["stage"] == 0:
+                    exit_reason = "SL"
+                    daily_sl += 1
 
-    direction = 1 if buy else -1
+                elif active["stage"] >= len(active["tps"]):
+                    exit_reason = "TP2"
 
-    remaining = (3 - trade["stage"]) / 3
+                else:
+                    exit_reason = "BE"
 
-    trade["pnl"] += (
-        remaining
-        * direction
-        * (float(candle.close) - trade["entry"])
-    )
+                daily_pnl += net
 
-    trade["closed"] = True
+                trades.append({
+                    "entry_time": active["t"],
+                    "exit_time": candle.t.isoformat(),
+                    "side": active["side"],
+                    "entry": active["entry"],
+                    "sl": active["sl"],
+                    "tp1": active["tps"][0],
+                    "tp2": active["tps"][1],
+                    "stage": active["stage"],
+                    "exit_reason": exit_reason,
+                    "gross_pnl": round(gross, 3),
+                    "spread": SPREAD,
+                    "net_pnl": round(net, 3),
+                    "net_pips": round(net * 10, 1)
+                })
 
-    return {
-        "exit_price": float(candle.close),
-        "reason": "EXPIRED"
-    }
+                cooldown = candle.t
+                active = None
 
+            # --------------------------------------
+            # Expiration: same 3-hour rule
+            # --------------------------------------
 
-# ==================================================
-# TRADE RECORD
-# ==================================================
+            elif active["stage"] == 0:
 
-def make_record(trade, result, close_time):
+                entry_time = pd.to_datetime(active["t"])
 
-    gross = float(trade["pnl"])
+                if candle.t - entry_time > timedelta(
+                    hours=bot.C["expire_h"]
+                ):
 
-    net = gross - SPREAD
+                    # Approximate manual close at candle close
+                    direction = (
+                        1 if active["side"] == "buy" else -1
+                    )
 
-    risk = abs(
-        trade["entry"] - trade["sl"]
-    )
+                    gross = (
+                        direction
+                        * (candle.close - active["entry"])
+                    )
 
-    return {
-        "entry_time": trade["t"],
-        "exit_time": close_time.isoformat(),
-        "side": trade["side"].upper(),
+                    net = gross - SPREAD
 
-        "entry": trade["entry"],
-        "initial_sl": trade["sl"],
+                    daily_pnl += net
 
-        "tp1": trade["tps"][0],
-        "tp2": trade["tps"][1],
-        "tp3": trade["tps"][2],
+                    trades.append({
+                        "entry_time": active["t"],
+                        "exit_time": candle.t.isoformat(),
+                        "side": active["side"],
+                        "entry": active["entry"],
+                        "sl": active["sl"],
+                        "tp1": active["tps"][0],
+                        "tp2": active["tps"][1],
+                        "stage": active["stage"],
+                        "exit_reason": "EXPIRE",
+                        "gross_pnl": round(gross, 3),
+                        "spread": SPREAD,
+                        "net_pnl": round(net, 3),
+                        "net_pips": round(net * 10, 1)
+                    })
 
-        "exit_price": result["exit_price"],
-        "exit_reason": result["reason"],
+                    cooldown = candle.t
+                    active = None
 
-        "stage": trade["stage"],
+        # ------------------------------------------
+        # Find new signal
+        # ------------------------------------------
 
-        "gross_pnl": round(gross, 3),
-        "spread": SPREAD,
-        "net_pnl": round(net, 3),
+        if active is None:
 
-        "risk": round(risk, 3)
-    }
+            blocked = (
+                daily_signals >= bot.C["max_signals"]
+                or daily_sl >= bot.C["max_sl"]
+                or daily_pnl >= bot.C["day_target"]
+            )
+
+            if blocked:
+                continue
+
+            if cooldown is not None:
+
+                if candle.t - cooldown < timedelta(
+                    minutes=bot.C["cool_min"]
+                ):
+                    continue
+
+            # Use history up to current candle
+            history = df.iloc[max(0, i - 300):i + 1]
+
+            signal = bot.signal(history)
+
+            if signal:
+
+                active = dict(
+                    signal,
+                    cur_sl=signal["sl"],
+                    stage=0,
+                    pnl=0.0,
+                    closed=False
+                )
+
+                daily_signals += 1
+
+    return trades, active
 
 
 # ==================================================
 # REPORT
 # ==================================================
 
-def report(records, candles, unfinished):
+def make_report(trades, days, trend):
 
-    columns = [
-        "entry_time",
-        "exit_time",
-        "side",
-        "entry",
-        "initial_sl",
-        "tp1",
-        "tp2",
-        "tp3",
-        "exit_price",
-        "exit_reason",
-        "stage",
-        "gross_pnl",
-        "spread",
-        "net_pnl",
-        "risk"
-    ]
+    if not trades:
+        return f"TS BOT BACKTEST\nDays: {days}\nNo completed trades."
 
-    df = pd.DataFrame(
-        records,
-        columns=columns
+    df = pd.DataFrame(trades)
+
+    pnl = df["net_pips"]
+
+    wins = df[pnl > 0]
+    losses = df[pnl < 0]
+
+    gross_profit = wins["net_pips"].sum()
+    gross_loss = abs(losses["net_pips"].sum())
+
+    pf = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else float("inf")
     )
 
-    # Always create CSV, even with zero trades.
-    df.to_csv(
-        OUTPUT_FILE,
-        index=False
-    )
+    equity = pnl.cumsum()
+    drawdown = equity.cummax() - equity
 
-    total = len(df)
+    win_rate = len(wins) / len(df) * 100
 
-    wins = 0
-    losses = 0
-    breakeven = 0
-
-    net_profit = 0.0
-    gross_profit = 0.0
-    gross_loss = 0.0
-
-    profit_factor = 0.0
-    win_rate = 0.0
-    avg_trade = 0.0
-    avg_r = 0.0
-    max_drawdown = 0.0
-
-    if total > 0:
-
-        wins = int(
-            (df["net_pnl"] > 0).sum()
-        )
-
-        losses = int(
-            (df["net_pnl"] < 0).sum()
-        )
-
-        breakeven = total - wins - losses
-
-        net_profit = float(
-            df["net_pnl"].sum()
-        )
-
-        gross_profit = float(
-            df.loc[
-                df["net_pnl"] > 0,
-                "net_pnl"
-            ].sum()
-        )
-
-        gross_loss = abs(
-            float(
-                df.loc[
-                    df["net_pnl"] < 0,
-                    "net_pnl"
-                ].sum()
-            )
-        )
-
-        if gross_loss > 0:
-            profit_factor = (
-                gross_profit / gross_loss
-            )
-
-        elif gross_profit > 0:
-            profit_factor = float("inf")
-
-        win_rate = wins / total * 100
-
-        avg_trade = net_profit / total
-
-        risk_values = df["risk"].replace(
-            0,
-            pd.NA
-        )
-
-        r_values = (
-            df["net_pnl"] / risk_values
-        ).dropna()
-
-        if len(r_values):
-            avg_r = float(r_values.mean())
-
-        equity = df["net_pnl"].cumsum()
-
-        peak = equity.cummax()
-
-        drawdown = equity - peak
-
-        max_drawdown = abs(
-            float(drawdown.min())
-        )
-
-    # Build Telegram report.
     lines = [
-        "📊 TS BOT BACKTEST RESULTS",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📅 Period: {DAYS} days",
-        f"🕯 Candles: {len(candles)}",
+        "📊 TS BOT BACKTEST",
+        f"Period: {days} days",
+        f"Trend EMA 144: {'ON' if trend else 'OFF'}",
         "",
-        f"📌 Total completed trades: {total}",
-        f"🟢 Wins: {wins}",
-        f"🔴 Losses: {losses}",
-        f"⚪ Breakeven: {breakeven}",
-        f"⏳ Open at end: {unfinished}",
+        f"Total trades: {len(df)}",
+        f"Wins: {len(wins)}",
+        f"Losses: {len(losses)}",
+        f"Win rate: {win_rate:.2f}%",
         "",
-        f"🎯 Win Rate: {win_rate:.2f}%",
-        f"💰 Net PnL: {net_profit:.2f}$",
-        f"📈 Gross Profit: {gross_profit:.2f}$",
-        f"📉 Gross Loss: {gross_loss:.2f}$",
-        f"⚖️ Profit Factor: {profit_factor:.3f}",
-        f"📊 Average Trade: {avg_trade:.2f}$",
-        f"📐 Average R: {avg_r:.3f}",
-        f"🔻 Max Drawdown: {max_drawdown:.2f}$",
+        f"Net PnL: {pnl.sum():.1f} pips",
+        f"Gross profit: {gross_profit:.1f} pips",
+        f"Gross loss: {gross_loss:.1f} pips",
+        f"Average trade: {pnl.mean():.2f} pips",
+        f"Profit Factor: {pf:.3f}",
+        f"Max Drawdown: {drawdown.max():.1f} pips",
         "",
-        "📍 EXIT BREAKDOWN"
+        "EXIT REASONS:"
     ]
 
-    if total:
+    for reason, count in df["exit_reason"].value_counts().items():
+        lines.append(f"{reason}: {count}")
 
-        for reason, count in (
-            df["exit_reason"].value_counts().items()
-        ):
-            lines.append(
-                f"{reason}: {count}"
-            )
+    lines.append("")
+    lines.append("DIRECTION:")
 
-        lines.extend([
-            "",
-            "📍 DIRECTION BREAKDOWN"
-        ])
+    for side in ("buy", "sell"):
 
-        for side, group in df.groupby("side"):
+        subset = df[df["side"] == side]
 
-            side_win_rate = (
-                group["net_pnl"] > 0
-            ).mean() * 100
+        if len(subset):
+
+            side_wins = (subset["net_pips"] > 0).sum()
 
             lines.append(
-                f"{side}: {len(group)} trades | "
-                f"PnL: {group['net_pnl'].sum():.2f}$ | "
-                f"Win Rate: {side_win_rate:.2f}%"
+                f"{side.upper()}: {len(subset)} trades | "
+                f"PnL {subset['net_pips'].sum():.1f} pips | "
+                f"Win rate {side_wins / len(subset) * 100:.2f}%"
             )
 
-    else:
-
-        lines.extend([
-            "No completed trades were found.",
-            "Check the downloaded market data and strategy conditions."
-        ])
-
-    lines.extend([
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "TS bot | Backtest finished",
-        "CSV file attached below."
-    ])
-
-    telegram_message = "\n".join(lines)
-
-    print("\n" + telegram_message)
-
-    # Send report and CSV to Telegram.
-    send_telegram(telegram_message)
-
-    send_csv_to_telegram()
-
-    print(f"\nCSV saved: {OUTPUT_FILE}")
+    return "\n".join(lines)
 
 
 # ==================================================
-# BACKTEST ENGINE
+# MAIN BACKTEST
 # ==================================================
 
-def run_backtest():
+def backtest():
 
-    if DAYS < 1:
-        raise ValueError("BT_DAYS must be at least 1")
+    original_trend = bot.C["trend"]
 
-    if not TG_TOKEN or not TG_CHAT:
-        raise RuntimeError(
-            "Telegram credentials are missing. "
-            "Add TG_TOKEN and TG_CHAT to GitHub Secrets."
-        )
+    try:
 
-    candles = fetch_history(DAYS)
+        df = download_history(BT_DAYS)
 
-    warmup = (
-        bot.C["lookback"]
-        + bot.C["sweep_win"]
-        + bot.C["atr_n"]
-        + 5
-    )
+        df.to_csv("candles_5m.csv", index=False)
 
-    if len(candles) <= warmup:
-        raise RuntimeError(
-            "Not enough candles for strategy warmup"
-        )
+        all_results = []
 
-    records = []
+        for trend in (False, True):
 
-    active = None
+            bot.C["trend"] = trend
 
-    cooldown_until = None
+            print("\n" + "=" * 45)
+            print("TREND FILTER:", trend)
+            print("=" * 45)
 
-    daily = {}
+            trades, unfinished = simulate(df)
 
-    print("\nRunning TS bot strategy...")
-
-    for i in range(warmup, len(candles)):
-
-        candle = candles.iloc[i]
-
-        candle_time = candle.t.to_pydatetime()
-
-        day = candle_time.date().isoformat()
-
-        if day not in daily:
-
-            daily[day] = {
-                "signals": 0,
-                "sl": 0,
-                "pnl": 0.0
-            }
-
-        stats = daily[day]
-
-        # ------------------------------------------
-        # MANAGE ACTIVE TRADE
-        # ------------------------------------------
-
-        if active is not None:
-
-            entry_time = (
-                pd.to_datetime(active["t"])
-                .to_pydatetime()
+            result = make_report(
+                trades,
+                BT_DAYS,
+                trend
             )
 
-            if candle_time >= entry_time:
+            print("\n" + result)
 
-                events, result = simulate_trade(
-                    active,
-                    candle
+            suffix = "trend" if trend else "no_trend"
+
+            filename = f"backtest_{suffix}.csv"
+
+            pd.DataFrame(trades).to_csv(
+                filename,
+                index=False
+            )
+
+            if unfinished is not None:
+                print(
+                    f"Open trade at end of test: "
+                    f"{unfinished['side'].upper()} "
+                    f"@ {unfinished['entry']}"
                 )
 
-                for event in events:
-                    print(
-                        f"[{event}] "
-                        f"{active['side'].upper()} "
-                        f"@ {active['entry']} "
-                        f"| {candle_time}"
-                    )
+            all_results.append(result)
 
-                # Trade closed by TP or SL.
-                if result is not None:
+        # Combined CSV from the final EMA-enabled run
+        # Each configuration also has its own CSV.
 
-                    record = make_record(
-                        active,
-                        result,
-                        candle_time
-                    )
+        print("\nBACKTEST COMPLETED SUCCESSFULLY")
 
-                    records.append(record)
-
-                    stats["pnl"] += (
-                        record["net_pnl"]
-                    )
-
-                    if result["reason"] == "SL":
-                        stats["sl"] += 1
-
-                    cooldown_until = (
-                        candle_time
-                        + timedelta(
-                            minutes=bot.C["cool_min"]
-                        )
-                    )
-
-                    print(
-                        f"[CLOSED] {result['reason']} "
-                        f"| Net PnL: "
-                        f"{record['net_pnl']:.2f}$"
-                    )
-
-                    active = None
-
-            # --------------------------------------
-            # EXPIRATION AFTER 3 HOURS
-            # --------------------------------------
-
-            if active is not None:
-
-                elapsed = (
-                    candle_time - entry_time
-                )
-
-                if (
-                    elapsed >= timedelta(
-                        hours=bot.C["expire_h"]
-                    )
-                    and active["stage"] == 0
-                ):
-
-                    result = expire_trade(
-                        active,
-                        candle
-                    )
-
-                    record = make_record(
-                        active,
-                        result,
-                        candle_time
-                    )
-
-                    records.append(record)
-
-                    stats["pnl"] += (
-                        record["net_pnl"]
-                    )
-
-                    cooldown_until = (
-                        candle_time
-                        + timedelta(
-                            minutes=bot.C["cool_min"]
-                        )
-                    )
-
-                    print(
-                        f"[EXPIRED] "
-                        f"Net PnL: "
-                        f"{record['net_pnl']:.2f}$"
-                    )
-
-                    active = None
-
-        # ------------------------------------------
-        # DO NOT OPEN A SECOND TRADE
-        # ------------------------------------------
-
-        if active is not None:
-            continue
-
-        # ------------------------------------------
-        # DAILY RESTRICTIONS
-        # ------------------------------------------
-
-        signal_time = (
-            candle_time
-            + timedelta(minutes=BAR_MINUTES)
+        telegram_message(
+            "\n\n".join(all_results)
         )
 
-        signal_day = signal_time.date().isoformat()
+        telegram_file("backtest_trend.csv")
 
-        if signal_day not in daily:
+        telegram_file("backtest_no_trend.csv")
 
-            daily[signal_day] = {
-                "signals": 0,
-                "sl": 0,
-                "pnl": 0.0
-            }
-
-        stats = daily[signal_day]
-
-        if not bot.in_session(signal_time):
-            continue
-
-        if stats["signals"] >= bot.C["max_signals"]:
-            continue
-
-        if stats["sl"] >= bot.C["max_sl"]:
-            continue
-
-        if stats["pnl"] >= bot.C["day_target"]:
-            continue
-
-        if (
-            cooldown_until is not None
-            and signal_time < cooldown_until
-        ):
-            continue
-
-        # ------------------------------------------
-        # CHECK STRATEGY SIGNAL
-        # ------------------------------------------
-
-        window = candles.iloc[:i + 1].copy()
-
-        signal = bot.signal(window)
-
-        if signal is None:
-            continue
-
-        active = new_trade(signal)
-
-        stats["signals"] += 1
-
-        print(
-            f"[SIGNAL] "
-            f"{signal['side'].upper()} "
-            f"@ {signal['entry']} "
-            f"| {signal['t']}"
-        )
-
-    # ----------------------------------------------
-    # OPEN TRADE AT END OF DATA
-    # ----------------------------------------------
-
-    unfinished = 0
-
-    if active is not None:
-
-        unfinished = 1
-
-        print(
-            "[OPEN AT END] "
-            f"{active['side'].upper()} "
-            f"@ {active['entry']} "
-            "| Not counted as a completed trade"
-        )
-
-    # ----------------------------------------------
-    # FINAL REPORT
-    # ----------------------------------------------
-
-    report(
-        records,
-        candles,
-        unfinished
-    )
+    finally:
+        bot.C["trend"] = original_trend
 
 
 # ==================================================
-# MAIN
+# ERROR HANDLING
 # ==================================================
 
 if __name__ == "__main__":
 
-    print("=" * 45)
-    print("TS BOT BACKTEST STARTED")
-    print("=" * 45)
-
     try:
-        run_backtest()
+        backtest()
 
     except Exception as error:
 
-        print("\nBACKTEST ERROR:", error)
+        import traceback
 
-        # Try to notify Telegram about failure.
-        if TG_TOKEN and TG_CHAT:
+        details = traceback.format_exc()
 
-            try:
-                send_telegram(
-                    "❌ TS BOT BACKTEST FAILED\n\n"
-                    f"Error:\n{str(error)[:3000]}"
-                )
+        print(details)
 
-            except Exception as telegram_error:
-                print(
-                    "Telegram error:",
-                    telegram_error
-                )
+        telegram_message(
+            "❌ TS BOT BACKTEST FAILED\n\n"
+            f"Error:\n{error}\n\n"
+            f"{details[-2500:]}"
+        )
 
         raise
+
