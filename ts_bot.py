@@ -11,9 +11,11 @@ from datetime import datetime, timezone, timedelta
 # TS BOT - XAUUSD
 # =========================================================
 
-TD_KEY = os.environ.get("TD_API_KEY", "")
+TD_KEY = os.environ.get("TWELVEDATA_KEY", "")
+
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
-TG_CHAT = os.environ.get("TG_CHAT_ID", "")
+
+TG_CHAT = os.environ.get("TG_CHAT", "")
 
 SYMBOL, TF, BAR = "XAU/USD", "5min", 5
 STATE = "state.json"
