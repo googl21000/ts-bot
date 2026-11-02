@@ -1,0 +1,33 @@
+name: Gold Pattern Bot
+on:
+  schedule:
+    - cron: "*/5 8-16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live | test | backtest"
+        default: "live"
+permissions:
+  contents: write
+concurrency:
+  group: gold-pattern
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas requests
+      - run: python gold_pattern_bot.py ${{ github.event.inputs.mode || 'live' }}
+        env:
+          TD_API_KEY: ${{ secrets.TD_API_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git commit -m "state" || exit 0
+          git push
