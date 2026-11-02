@@ -1,20 +1,16 @@
 
 import os
-import sys
 import json
-import time
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
-# =========================================================
-# TS BOT - XAUUSD
-# =========================================================
+# ==================================================
+# TS BOT CONFIG
+# ==================================================
 
 TD_KEY = os.environ.get("TWELVEDATA_KEY", "")
-
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
-
 TG_CHAT = os.environ.get("TG_CHAT", "")
 
 SYMBOL, TF, BAR = "XAU/USD", "5min", 5
@@ -23,7 +19,7 @@ SPREAD = 0.9
 STALE_MIN = 10
 
 C = dict(
-    sess=(8 * 60, 13 * 60 + 30),  # UTC = 09:00-14:30 الجزائر
+    sess=(8 * 60, 13 * 60 + 30),
     lookback=36,
     sweep_win=6,
     atr_n=14,
@@ -39,277 +35,217 @@ C = dict(
     expire_h=3,
 )
 
-# =========================================================
+# ==================================================
 # DATA
-# =========================================================
+# ==================================================
 
 def fetch(n=300, end=None):
-    if not TD_KEY:
-        raise RuntimeError("Missing environment variable: TD_API_KEY")
-
-    params = {
-        "symbol": SYMBOL,
-        "interval": TF,
-        "outputsize": n,
-        "timezone": "UTC",
-        "apikey": TD_KEY,
-    }
+    p = dict(
+        symbol=SYMBOL,
+        interval=TF,
+        outputsize=n,
+        timezone="UTC",
+        apikey=TD_KEY
+    )
 
     if end:
-        params["end_date"] = end
+        p["end_date"] = end
 
-    response = requests.get(
+    r = requests.get(
         "https://api.twelvedata.com/time_series",
-        params=params,
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
+        params=p,
+        timeout=30
+    ).json()
 
-    if "values" not in data:
-        raise RuntimeError(f"TwelveData error: {data}")
+    if "values" not in r:
+        raise RuntimeError(r)
 
-    df = pd.DataFrame(data["values"])
+    df = pd.DataFrame(r["values"])
     df["t"] = pd.to_datetime(df["datetime"], utc=True)
 
     for col in ("open", "high", "low", "close"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = df[col].astype(float)
 
-    df = df[["t", "open", "high", "low", "close"]]
-    df = df.dropna()
-    return df.sort_values("t").drop_duplicates("t").reset_index(drop=True)
+    return (
+        df[["t", "open", "high", "low", "close"]]
+        .sort_values("t")
+        .reset_index(drop=True)
+    )
 
 
 def atr(df, n):
-    previous_close = df.close.shift()
+    pc = df.close.shift()
 
     tr = pd.concat(
         [
             df.high - df.low,
-            (df.high - previous_close).abs(),
-            (df.low - previous_close).abs(),
+            (df.high - pc).abs(),
+            (df.low - pc).abs()
         ],
-        axis=1,
+        axis=1
     ).max(axis=1)
 
     return tr.rolling(n).mean()
 
 
 def in_session(t):
-    minutes = t.hour * 60 + t.minute
+    m = t.hour * 60 + t.minute
+
     return (
         t.weekday() < 5
-        and C["sess"][0] <= minutes < C["sess"][1]
+        and C["sess"][0] <= m < C["sess"][1]
     )
 
 
-# =========================================================
+# ==================================================
 # STRATEGY
-# =========================================================
+# ==================================================
 
 def signal(df):
-    required = max(
-        C["lookback"] + C["sweep_win"] + 2,
-        C["ema"] + 10,
-    )
+    n = C["lookback"] + C["sweep_win"]
 
-    if len(df) < required:
+    if len(df) < max(n + 2, C["ema"] + 10):
         return None
 
     last = df.iloc[-1]
-    signal_time = last.t + timedelta(minutes=BAR)
+    t_in = last.t + timedelta(minutes=BAR)
 
-    if not in_session(signal_time):
+    if not in_session(t_in):
         return None
 
-    current_atr = atr(df, C["atr_n"]).iloc[-1]
+    a = atr(df, C["atr_n"]).iloc[-1]
 
-    if pd.isna(current_atr) or current_atr <= 0:
+    if not a > 0:
         return None
 
-    candle_body = abs(last.close - last.open)
-
-    if candle_body < C["body_atr"] * current_atr:
+    if abs(last.close - last.open) < C["body_atr"] * a:
         return None
 
-    ema_value = (
+    ema = (
         df.close
         .ewm(span=C["ema"], adjust=False)
         .mean()
         .iloc[-1]
     )
 
-    window = df.iloc[-C["sweep_win"]:]
-    reference = df.iloc[
-        -(C["lookback"] + C["sweep_win"]):-C["sweep_win"]
-    ]
+    w = df.iloc[-C["sweep_win"]:]
+    ref = df.iloc[-n:-C["sweep_win"]]
 
     for buy in (True, False):
 
-        if C["trend"]:
-            if buy and last.close < ema_value:
-                continue
-            if not buy and last.close > ema_value:
-                continue
-
-        extreme = window.low.min() if buy else window.high.max()
-        level = reference.low.min() if buy else reference.high.max()
-
-        if buy:
-            valid = (
-                extreme < level
-                and last.close > level
-                and last.close > last.open
-            )
-        else:
-            valid = (
-                extreme > level
-                and last.close < level
-                and last.close < last.open
-            )
-
-        if not valid:
+        if C["trend"] and (
+            (buy and last.close < ema)
+            or (not buy and last.close > ema)
+        ):
             continue
 
-        extreme_index = (
-            window.low.idxmin()
-            if buy
-            else window.high.idxmax()
+        ex = w.low.min() if buy else w.high.max()
+        lvl = ref.low.min() if buy else ref.high.max()
+
+        if buy and not (
+            ex < lvl
+            and last.close > lvl
+            and last.close > last.open
+        ):
+            continue
+
+        if not buy and not (
+            ex > lvl
+            and last.close < lvl
+            and last.close < last.open
+        ):
+            continue
+
+        pos = list(w.index).index(
+            w.low.idxmin() if buy else w.high.idxmax()
         )
 
-        position = list(window.index).index(extreme_index)
-        middle = window.iloc[position:-1]
+        mid = w.iloc[pos:-1]
 
-        if len(middle):
-            if buy and last.close <= middle.high.max():
-                continue
-            if not buy and last.close >= middle.low.min():
-                continue
+        if len(mid) and (
+            (buy and last.close <= mid.high.max())
+            or (not buy and last.close >= mid.low.min())
+        ):
+            continue
 
-        entry = last.close
-        direction = 1 if buy else -1
+        e = last.close
+        d = 1 if buy else -1
 
-        return {
-            "side": "buy" if buy else "sell",
-            "entry": round(entry, 2),
-            "sl": round(entry - direction * C["sl"], 2),
-            "tps": [
-                round(entry + direction * target, 2)
-                for target in C["tp"]
+        return dict(
+            side="buy" if buy else "sell",
+            entry=round(e, 2),
+            sl=round(e - d * C["sl"], 2),
+            tps=[
+                round(e + d * x, 2)
+                for x in C["tp"]
             ],
-            "t": signal_time.isoformat(),
-        }
+            t=t_in.isoformat()
+        )
 
     return None
 
 
-# =========================================================
+# ==================================================
 # TRADE MANAGEMENT
-# =========================================================
+# ==================================================
 
-def step(s, candle):
-    """
-    إدارة الصفقة على شمعة واحدة.
-    عند تعارض الوقف والهدف داخل الشمعة، نعتمد التنفيذ المحافظ:
-    الوقف أولاً.
-    """
+def step(s, b):
+    """يحدّث الصفقة بشمعة واحدة. الوقف أولاً عند التعارض داخل الشمعة."""
 
-    events = []
+    ev = []
     buy = s["side"] == "buy"
-    direction = 1 if buy else -1
-    total_targets = len(s["tps"])
+    d = 1 if buy else -1
+    k = len(s["tps"])
 
-    def stop_hit(stop_price):
-        if buy:
-            return candle.low <= stop_price
-        return candle.high >= stop_price
-
-    # فحص الوقف الحالي أولاً
-    if stop_hit(s["cur_sl"]):
-        remaining = (total_targets - s["stage"]) / total_targets
-
+    if (b.low <= s["cur_sl"]) if buy else (b.high >= s["cur_sl"]):
         s["pnl"] += (
-            remaining
-            * direction
+            (k - s["stage"]) / k
+            * d
             * (s["cur_sl"] - s["entry"])
         )
 
         s["closed"] = True
-        events.append("SL" if s["stage"] == 0 else "BE")
-        return events
+        ev.append("SL" if s["stage"] == 0 else "BE")
+        return ev
 
-    # فحص الأهداف
-    while s["stage"] < total_targets:
+    while s["stage"] < k:
 
-        target = s["tps"][s["stage"]]
+        tp = s["tps"][s["stage"]]
 
-        target_hit = (
-            candle.high >= target
-            if buy
-            else candle.low <= target
-        )
+        if (b.high >= tp) if buy else (b.low <= tp):
 
-        if not target_hit:
+            s["pnl"] += d * (tp - s["entry"]) / k
+            s["stage"] += 1
+            ev.append(f"TP{s['stage']}")
+
+            if s["stage"] == 1:
+                s["cur_sl"] = s["entry"]
+
+        else:
             break
 
-        s["pnl"] += (
-            direction
-            * (target - s["entry"])
-            / total_targets
-        )
-
-        s["stage"] += 1
-        events.append(f"TP{s['stage']}")
-
-        # بعد TP1 ننقل الوقف إلى الدخول
-        if s["stage"] == 1:
-            s["cur_sl"] = s["entry"]
-
-            # إذا لمست الشمعة نقطة الدخول أيضاً،
-            # نفترض أن الوقف تحقق قبل الهدف التالي.
-            if stop_hit(s["cur_sl]):
-                remaining = (
-                    total_targets - s["stage"]
-                ) / total_targets
-
-                s["pnl"] += (
-                    remaining
-                    * direction
-                    * (s["cur_sl"] - s["entry"])
-                )
-
-                s["closed"] = True
-                events.append("BE")
-                return events
-
-    if s["stage"] == total_targets:
+    if s["stage"] == k:
         s["closed"] = True
 
-    return events
+    return ev
 
 
-# =========================================================
+# ==================================================
 # TELEGRAM
-# =========================================================
+# ==================================================
 
-def tg(message):
-    print(message)
+def tg(msg):
+    print(msg)
 
-    if not TG_TOKEN or not TG_CHAT:
-        return
-
-    try:
+    if TG_TOKEN:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={
                 "chat_id": TG_CHAT,
-                "text": message,
+                "text": msg
             },
-            timeout=30,
-        ).raise_for_status()
-
-    except Exception as error:
-        print(f"Telegram error: {error}")
+            timeout=30
+        )
 
 
 def pips(a, b):
@@ -317,25 +253,23 @@ def pips(a, b):
 
 
 def fmt(s):
-    signal_time = (
-        pd.to_datetime(s["t"]) + timedelta(hours=1)
-    )
+    t = pd.to_datetime(s["t"]) + timedelta(hours=1)
 
     buy = s["side"] == "buy"
-    heading = "🟢 BUY" if buy else "🔴 SELL"
+    head = "🟢 BUY" if buy else "🔴 SELL"
 
-    targets = "\n".join(
-        f"✅ TP{i + 1}: {price} (+{pips(price, s['entry'])} pip)"
-        for i, price in enumerate(s["tps"])
+    tps = "\n".join(
+        f"✅ TP{i+1}: {x} (+{pips(x, s['entry'])})"
+        for i, x in enumerate(s["tps"])
     )
 
     return (
-        f"{heading} XAUUSD\n"
-        f"⏰ {signal_time:%H:%M} الجزائر\n"
+        f"{head} XAUUSD (الآن)\n"
+        f"⏰ {t:%H:%M} (الجزائر)\n"
         f"➡️ الدخول: {s['entry']}\n"
         f"🛑 الوقف: {s['sl']} "
         f"({pips(s['entry'], s['sl'])} pip)\n"
-        f"{targets}\n"
+        f"{tps}\n"
         f"📌 عند TP1: انقل الوقف إلى الدخول\n"
         f"⚠️ لا تدخل إذا ابتعد السعر أكثر من 10 pip عن الدخول"
     )
@@ -344,435 +278,164 @@ def fmt(s):
 MSG = {
     "TP1": "✅ TP1 تحقق — انقل الوقف إلى الدخول",
     "TP2": "🏁 TP2 تحقق — اكتملت الصفقة",
-    "SL": "❌ ضُرب وقف الخسارة",
-    "BE": "⚪ أُغلقت الصفقة على نقطة الدخول",
+    "SL": "❌ ضُرب الوقف",
+    "BE": "⚪ أُغلقت على نقطة الدخول"
 }
 
 
-# =========================================================
-# LIVE BOT
-# =========================================================
+# ==================================================
+# LIVE
+# ==================================================
 
 def load():
     try:
-        with open(STATE, "r") as file:
-            return json.load(file)
+        return json.load(open(STATE))
 
     except Exception:
-        return {
-            "open": None,
-            "day": None,
-            "n": 0,
-            "sl": 0,
-            "pnl": 0.0,
-            "last_sig": None,
-            "cool": None,
-        }
-
-
-def save_state(state):
-    with open(STATE, "w") as file:
-        json.dump(state, file, indent=2)
+        return dict(
+            open=None,
+            day=None,
+            n=0,
+            sl=0,
+            pnl=0.0,
+            last_sig=None,
+            cool=None
+        )
 
 
 def live():
-    state = load()
+    st = load()
     now = datetime.now(timezone.utc)
 
     df = fetch(300)
 
-    # الشموع المغلقة فقط
     df = df[
         df.t + timedelta(minutes=BAR) <= now
     ].reset_index(drop=True)
 
-    if df.empty:
-        print("No closed candles available.")
-        return
+    day = now.date().isoformat()
 
-    today = now.date().isoformat()
-
-    if state["day"] != today:
-        state.update(
-            day=today,
+    if st["day"] != day:
+        st.update(
+            day=day,
             n=0,
             sl=0,
-            pnl=0.0,
+            pnl=0.0
         )
 
-    trade = state["open"]
+    s = st["open"]
 
-    if trade:
-        since = pd.to_datetime(trade["t"])
+    if s:
+        since = pd.to_datetime(s["t"])
+
         seen = (
-            pd.to_datetime(trade["seen"])
-            if trade.get("seen")
+            pd.to_datetime(s["seen"])
+            if s.get("seen")
             else None
         )
 
-        candles = df[df.t >= since]
+        for _, b in df[df.t >= since].iterrows():
 
-        for _, candle in candles.iterrows():
-
-            if seen is not None and candle.t <= seen:
+            if seen is not None and b.t <= seen:
                 continue
 
-            trade["seen"] = candle.t.isoformat()
+            s["seen"] = b.t.isoformat()
 
-            for event in step(trade, candle):
+            for e in step(s, b):
                 tg(
-                    f"{MSG[event]}\n"
-                    f"({trade['side'].upper()} @ {trade['entry']})"
+                    f"{MSG[e]}\n"
+                    f"({s['side'].upper()} @ {s['entry']})"
                 )
 
-            if trade["closed"]:
+            if s["closed"]:
                 break
 
-        if trade["closed"]:
-            state["pnl"] += trade["pnl"] - SPREAD
+        if s["closed"]:
 
-            if trade["stage"] == 0:
-                state["sl"] += 1
+            st["pnl"] += s["pnl"] - SPREAD
 
-            state["open"] = None
-            state["cool"] = now.isoformat()
+            if s["stage"] == 0:
+                st["sl"] += 1
+
+            st["open"], st["cool"] = None, now.isoformat()
 
         elif (
             now - since > timedelta(hours=C["expire_h"])
-            and trade["stage"] == 0
+            and s["stage"] == 0
         ):
+
             tg(
                 f"⏱ انتهت صلاحية الصفقة "
-                f"({trade['side'].upper()} @ {trade['entry']}) "
+                f"({s['side'].upper()} @ {s['entry']}) "
                 f"— أغلقها يدوياً"
             )
 
-            state["open"] = None
-            state["cool"] = now.isoformat()
+            st["open"], st["cool"] = None, now.isoformat()
 
-    if state["open"] is None:
+    if not st["open"] and len(df):
 
-        last_candle_time = (
-            df.t.iloc[-1] + timedelta(minutes=BAR)
-        )
+        last_t = df.t.iloc[-1] + timedelta(minutes=BAR)
 
         fresh = (
-            now - last_candle_time
+            now - last_t
             <= timedelta(minutes=STALE_MIN)
         )
 
-        cooling = False
-
-        if state["cool"]:
-            cooling = (
-                now - pd.to_datetime(state["cool"])
-                < timedelta(minutes=C["cool_min"])
-            )
+        cool = (
+            st["cool"]
+            and now - pd.to_datetime(st["cool"])
+            < timedelta(minutes=C["cool_min"])
+        )
 
         blocked = (
-            state["n"] >= C["max_signals"]
-            or state["sl"] >= C["max_sl"]
-            or state["pnl"] >= C["day_target"]
-            or cooling
+            st["n"] >= C["max_signals"]
+            or st["sl"] >= C["max_sl"]
+            or st["pnl"] >= C["day_target"]
+            or cool
         )
 
         if fresh and not blocked:
-            new_signal = signal(df)
 
-            if (
-                new_signal
-                and new_signal["t"] != state["last_sig"]
-            ):
-                tg(fmt(new_signal))
+            sg = signal(df)
 
-                state["last_sig"] = new_signal["t"]
+            if sg and sg["t"] != st["last_sig"]:
 
-                state["open"] = dict(
-                    new_signal,
-                    cur_sl=new_signal["sl"],
+                tg(fmt(sg))
+
+                st["last_sig"] = sg["t"]
+
+                st["open"] = dict(
+                    sg,
+                    cur_sl=sg["sl"],
                     stage=0,
                     pnl=0.0,
                     closed=False,
-                    seen=None,
+                    seen=None
                 )
 
-                state["n"] += 1
+                st["n"] += 1
 
-    save_state(state)
-
-
-# =========================================================
-# BACKTEST
-# =========================================================
-
-def simulate(df):
-    trades = []
-
-    trade = None
-    current_day = None
-    daily_signals = 0
-    daily_sl = 0
-    daily_pnl = 0.0
-    cooldown = None
-
-    for i in range(len(df)):
-
-        candle = df.iloc[i]
-
-        if candle.t.date() != current_day:
-            current_day = candle.t.date()
-            daily_signals = 0
-            daily_sl = 0
-            daily_pnl = 0.0
-
-        # إدارة الصفقة المفتوحة
-        if trade is not None:
-
-            events = step(trade, candle)
-
-            if trade["closed"]:
-                net = trade["pnl"] - SPREAD
-                daily_pnl += net
-
-                if trade["stage"] == 0:
-                    daily_sl += 1
-
-                trades.append({
-                    "entry_time": trade["t"],
-                    "exit_time": candle.t.isoformat(),
-                    "side": trade["side"],
-                    "entry": trade["entry"],
-                    "sl": trade["sl"],
-                    "tp1": trade["tps"][0],
-                    "tp2": trade["tps"][1],
-                    "stage": trade["stage"],
-                    "exit_reason": (
-                        "SL" if trade["stage"] == 0
-                        else "TP2" if trade["stage"] == 2
-                        else "BE"
-                    ),
-                    "gross_pnl": round(trade["pnl"], 3),
-                    "spread": SPREAD,
-                    "net_pnl": round(net, 3),
-                    "net_pips": round(net * 10, 1),
-                })
-
-                cooldown = candle.t
-                trade = None
-
-        # البحث عن إشارة جديدة
-        if trade is None:
-
-            if (
-                daily_signals >= C["max_signals"]
-                or daily_sl >= C["max_sl"]
-                or daily_pnl >= C["day_target"]
-            ):
-                continue
-
-            if (
-                cooldown is not None
-                and candle.t - cooldown
-                < timedelta(minutes=C["cool_min"])
-            ):
-                continue
-
-            history = df.iloc[max(0, i - 300):i + 1]
-
-            new_signal = signal(history)
-
-            if new_signal:
-                trade = dict(
-                    new_signal,
-                    cur_sl=new_signal["sl"],
-                    stage=0,
-                    pnl=0.0,
-                    closed=False,
-                )
-
-                daily_signals += 1
-
-    return trades
+    json.dump(st, open(STATE, "w"), indent=1)
 
 
-def report(trades, name):
-    if not trades:
-        print(f"\n{name}: no trades")
-        return
-
-    pnl = [x["net_pips"] for x in trades]
-
-    wins = [x for x in pnl if x > 0]
-    losses = [x for x in pnl if x < 0]
-
-    gross_profit = sum(wins)
-    gross_loss = abs(sum(losses))
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else float("inf")
-    )
-
-    equity = pd.Series(pnl).cumsum()
-    drawdown = equity.cummax() - equity
-
-    print(f"\n========== {name} ==========")
-    print(f"Trades: {len(pnl)}")
-    print(f"Wins: {len(wins)}")
-    print(f"Losses: {len(losses)}")
-    print(f"Win rate: {len(wins) / len(pnl):.2%}")
-    print(f"Net PnL: {sum(pnl):.1f} pips")
-    print(f"Average trade: {sum(pnl) / len(pnl):.2f} pips")
-    print(f"Gross profit: {gross_profit:.1f} pips")
-    print(f"Gross loss: {gross_loss:.1f} pips")
-    print(f"Profit Factor: {profit_factor:.2f}")
-    print(f"Max Drawdown: {drawdown.max():.1f} pips")
-
-    print("\nExit reasons:")
-    print(
-        pd.Series(
-            [x["exit_reason"] for x in trades]
-        ).value_counts().to_string()
-    )
-
-    print("\nDirection:")
-    for side in ("buy", "sell"):
-        subset = [
-            x for x in trades
-            if x["side"] == side
-        ]
-
-        if subset:
-            side_pnl = sum(x["net_pips"] for x in subset)
-            side_wins = sum(
-                x["net_pips"] > 0 for x in subset
-            )
-
-            print(
-                f"{side.upper()}: {len(subset)} trades | "
-                f"PnL {side_pnl:.1f} pips | "
-                f"Win rate {side_wins / len(subset):.2%}"
-            )
-
-
-def backtest(pages=6):
-    parts = []
-    end = None
-
-    print("Downloading historical candles...")
-
-    for page in range(pages):
-        print(f"Downloading page {page + 1}/{pages}")
-
-        data = fetch(5000, end)
-        parts.append(data)
-
-        oldest = data.t.min()
-
-        # الانتقال إلى ما قبل أقدم شمعة في الصفحة السابقة
-        end = (
-            oldest - timedelta(minutes=BAR)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-
-        time.sleep(9)
-
-    df = (
-        pd.concat(parts)
-        .drop_duplicates("t")
-        .sort_values("t")
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise RuntimeError("No historical candles downloaded.")
-
-    df.to_csv("candles_5m.csv", index=False)
-
-    print(
-        f"\nHistory: {df.t.iloc[0]} -> {df.t.iloc[-1]}"
-    )
-    print(f"Total candles: {len(df)}")
-
-    original_trend = C["trend"]
-
-    try:
-        for trend_filter in (False, True):
-
-            C["trend"] = trend_filter
-
-            name = (
-                "WITH EMA 144 FILTER"
-                if trend_filter
-                else "WITHOUT EMA FILTER"
-            )
-
-            trades = simulate(df)
-
-            report(trades, name)
-
-            october_trades = [
-                x for x in trades
-                if pd.to_datetime(x["entry_time"]).date()
-                >= datetime(2026, 10, 1).date()
-            ]
-
-            report(
-                october_trades,
-                name + " - OCTOBER",
-            )
-
-            filename = (
-                "backtest_trend.csv"
-                if trend_filter
-                else "backtest_no_trend.csv"
-            )
-
-            pd.DataFrame(trades).to_csv(
-                filename,
-                index=False,
-            )
-
-    finally:
-        C["trend"] = original_trend
-
-    print("\nBacktest completed.")
-    print("Files saved:")
-    print("- candles_5m.csv")
-    print("- backtest_trend.csv")
-    print("- backtest_no_trend.csv")
-
-
-# =========================================================
+# ==================================================
 # MAIN
-# =========================================================
+# ==================================================
 
-if __name__ == "__main__":
+def main():
+    import sys
 
-    mode = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else "live"
-    )
+    mode = sys.argv[1] if len(sys.argv) > 1 else "live"
 
     if mode == "live":
         live()
 
     elif mode == "test":
-        tg("✅ TS bot متصل بنجاح")
-
-    elif mode == "backtest":
-        pages = (
-            int(sys.argv[2])
-            if len(sys.argv) > 2
-            else 6
-        )
-
-        backtest(pages)
+        tg("✅ البوت متصل")
 
     else:
-        print("Usage:")
-        print("python ts_bot.py live")
-        print("python ts_bot.py test")
-        print("python ts_bot.py backtest 6")
+        print("Unknown mode. Use: live or test")
 
+
+if __name__ == "__main__":
+    main()
