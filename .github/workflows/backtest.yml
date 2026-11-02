@@ -1,46 +1,57 @@
-
-name: TS bot Backtest
+name: Backtest
 
 on:
   workflow_dispatch:
     inputs:
       days:
-        description: "Number of days"
-        required: true
-        default: "90"
+        description: 'Days back'
+        type: string
+        default: '90'
+      htf_required:
+        description: 'Require a 30m FVG/OB at the sweep'
+        type: boolean
+        default: true
+      cancel_half_if:
+        description: 'Cancel the :30 candle if the :00 candle ...'
+        type: choice
+        options:
+          - sweep
+          - setup
+        default: sweep
+      entry_mode:
+        description: 'Entry inside the zone'
+        type: choice
+        options:
+          - proximal
+          - mid
+        default: proximal
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
-
+    timeout-minutes: 60
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests
-
-      - name: Run TS bot Backtest
-        run: python backtest.py
+          python-version: '3.12'
+      - run: pip install pandas requests matplotlib
+      - name: Run backtest
         env:
-          BT_DAYS: ${{ inputs.days }}
           TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
-
-      - name: Upload CSV Results
-        uses: actions/upload-artifact@v4
+          DAYS: ${{ github.event.inputs.days }}
+          HTF_REQUIRED: ${{ github.event.inputs.htf_required }}
+          CANCEL_HALF_IF: ${{ github.event.inputs.cancel_half_if }}
+          ENTRY_MODE: ${{ github.event.inputs.entry_mode }}
+        run: python backtest.py
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: TS-bot-backtest-results
-          path:  backtest_trend.csv
-                 backtest_no_trend.csv
-                 candles_5m.csv
-          if-no-files-found: error
+          name: backtest-results
+          path: |
+            backtest_summary.txt
+            backtest_trades.csv
+            backtest_equity.png
+          if-no-files-found: ignore
