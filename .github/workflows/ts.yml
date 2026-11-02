@@ -1,31 +1,40 @@
+
 name: TS Bot
+
 on:
   schedule:
-    - cron: "*/5 8-16 * * 1-5"
+    - cron: '30 5,6 * * 1-5'
+    - cron: '30 10,11 * * 1-5'
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "live | test | backtest"
-        default: "live"
+
 permissions:
   contents: write
-concurrency:
-  group: gold-pattern
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 330
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
+
       - run: pip install pandas requests
-      - run: python gold_pattern_bot.py ${{ github.event.inputs.mode || 'live' }}
+
+      - name: Run TS Bot
+        run: python ts_bot.py
         env:
-          TD_API_KEY: ${{ secrets.TD_API_KEY }}
+          ONE_SHOT: "1"
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      - run: |
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+
+      - name: Save state
+        if: always()
+        run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add state.json || true
