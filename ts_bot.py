@@ -1,440 +1,397 @@
+"""
+TS Strategy Bot - XAUUSD
+Time (NY golden candles) + Sweep + MSS + OB/FVG entry -> Telegram alert.
+All times are New York time.
 
-import os
+Env vars (same names as the GitHub secrets):
+  TWELVEDATA_KEY, TG_TOKEN, TG_CHAT
+  ANTHROPIC_API_KEY   (optional: adds a short Claude review to each alert)
+  ONE_SHOT=1          (run as a session: exit when no golden window is active/upcoming)
+
+Usage:
+  python ts_bot.py            # loop
+  python ts_bot.py --once     # single scan
+  python ts_bot.py --test     # send a Telegram test message
+
+Not financial advice.
+"""
+import argparse
 import json
-import requests
+import os
+import time
+from datetime import timedelta
+
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+import requests
 
-# ==================================================
-# TS BOT CONFIG
-# ==================================================
+# ============================ SETTINGS ============================
+NY = "America/New_York"
+SYMBOL = "XAU/USD"
+GOLDEN = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
 
-TD_KEY = os.environ.get("TWELVEDATA_KEY", "")
-TG_TOKEN = os.environ.get("TG_TOKEN", "")
-TG_CHAT = os.environ.get("TG_CHAT", "")
+HTF_POI_REQUIRED = True    # sweep must happen inside a 30m FVG/OB
+ZONE_TOL = 2.0             # tolerance (USD) for "inside the 30m zone"
+ENTRY_MODE = "proximal"    # "proximal" = near edge of the entry zone | "mid" = middle
+MIN_RR_TP1 = 1.0           # minimum reward/risk for TP1
+CANCEL_HALF_IF = "sweep"   # cancel the :30 candle if the :00 candle ... "sweep" | "setup"
+SWING_K_MSS = 2            # swing strength used for the MSS reference (3m)
+SWING_K_TP = 5             # swing strength used for TP liquidity (3m)
+WINDOW_AFTER = timedelta(minutes=60)   # how long a golden candle stays active
+UPCOMING_MIN = 35          # session start buffer before a golden candle
+POLL_SECONDS = 60
+SEEN_FILE = "seen.json"
 
-SYMBOL, TF, BAR = "XAU/USD", "5min", 5
-STATE = "state.json"
-SPREAD = 0.9
-STALE_MIN = 10
+TD_KEY = os.getenv("TWELVEDATA_KEY", "")
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT = os.getenv("TG_CHAT", "")
+AI_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-C = dict(
-    sess=(8 * 60, 13 * 60 + 30),
-    lookback=36,
-    sweep_win=6,
-    atr_n=14,
-    body_atr=0.5,
-    sl=5.0,
-    tp=(5.0, 10.0),
-    trend=True,
-    ema=144,
-    max_signals=3,
-    max_sl=2,
-    day_target=10.0,
-    cool_min=15,
-    expire_h=3,
-)
+M1 = pd.Timedelta(minutes=1)
+M3 = pd.Timedelta(minutes=3)
+M30 = pd.Timedelta(minutes=30)
 
-# ==================================================
-# DATA
-# ==================================================
 
-def fetch(n=300, end=None):
-    p = dict(
-        symbol=SYMBOL,
-        interval=TF,
-        outputsize=n,
-        timezone="UTC",
-        apikey=TD_KEY
-    )
-
-    if end:
-        p["end_date"] = end
-
+# ============================== DATA ==============================
+def fetch_1m(now=None):
+    """Twelve Data has no 3min interval, so we pull 1min and resample."""
+    now = now if now is not None else pd.Timestamp.now(tz=NY)
     r = requests.get(
         "https://api.twelvedata.com/time_series",
-        params=p,
-        timeout=30
-    ).json()
-
-    if "values" not in r:
-        raise RuntimeError(r)
-
-    df = pd.DataFrame(r["values"])
-    df["t"] = pd.to_datetime(df["datetime"], utc=True)
-
-    for col in ("open", "high", "low", "close"):
-        df[col] = df[col].astype(float)
-
-    return (
-        df[["t", "open", "high", "low", "close"]]
-        .sort_values("t")
-        .reset_index(drop=True)
+        params=dict(symbol=SYMBOL, interval="1min", outputsize=3000,
+                    timezone=NY, apikey=TD_KEY),
+        timeout=25,
     )
+    j = r.json()
+    if "values" not in j:
+        raise RuntimeError(j)
+    df = pd.DataFrame(j["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    df.index = df.index.tz_localize(NY, ambiguous="NaT", nonexistent="shift_forward")
+    df = df[df.index.notna()]
+    df = df[["open", "high", "low", "close"]].astype(float)
+    return df[df.index + M1 <= now]   # drop the minute that is still forming
 
 
-def atr(df, n):
-    pc = df.close.shift()
-
-    tr = pd.concat(
-        [
-            df.high - df.low,
-            (df.high - pc).abs(),
-            (df.low - pc).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return tr.rolling(n).mean()
+def resample(df1, rule):
+    r = df1.resample(rule, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    end = r.index + pd.Timedelta(rule)
+    return r[end <= df1.index[-1] + M1]   # keep only completed candles
 
 
-def in_session(t):
-    m = t.hour * 60 + t.minute
+def flip(df):
+    """Mirror prices so the SELL logic can also detect BUY setups."""
+    o = df.copy()
+    o["open"], o["close"] = -df["open"], -df["close"]
+    o["high"], o["low"] = -df["low"], -df["high"]
+    return o
 
-    return (
-        t.weekday() < 5
-        and C["sess"][0] <= m < C["sess"][1]
-    )
+
+# ============================ STRUCTURE ============================
+def swing_lows(low, k):
+    return [i for i in range(k, len(low) - k) if low[i] <= min(low[i - k:i + k + 1])]
 
 
-# ==================================================
-# STRATEGY
-# ==================================================
+def bearish_zones(df):
+    """Bearish FVG and OB zones: (end_time, low, high, kind)."""
+    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
+    zones = []
+    for i in range(2, len(df)):
+        if l[i - 2] > h[i]:
+            zones.append((df.index[i], h[i], l[i - 2], "FVG"))
+            for j in range(i - 2, max(i - 7, -1), -1):
+                if c[j] > o[j]:
+                    zones.append((df.index[i], l[j], h[j], "OB"))
+                    break
+    return zones
 
-def signal(df):
-    n = C["lookback"] + C["sweep_win"]
 
-    if len(df) < max(n + 2, C["ema"] + 10):
-        return None
-
-    last = df.iloc[-1]
-    t_in = last.t + timedelta(minutes=BAR)
-
-    if not in_session(t_in):
-        return None
-
-    a = atr(df, C["atr_n"]).iloc[-1]
-
-    if not a > 0:
-        return None
-
-    if abs(last.close - last.open) < C["body_atr"] * a:
-        return None
-
-    ema = (
-        df.close
-        .ewm(span=C["ema"], adjust=False)
-        .mean()
-        .iloc[-1]
-    )
-
-    w = df.iloc[-C["sweep_win"]:]
-    ref = df.iloc[-n:-C["sweep_win"]]
-
-    for buy in (True, False):
-
-        if C["trend"] and (
-            (buy and last.close < ema)
-            or (not buy and last.close > ema)
-        ):
-            continue
-
-        ex = w.low.min() if buy else w.high.max()
-        lvl = ref.low.min() if buy else ref.high.max()
-
-        if buy and not (
-            ex < lvl
-            and last.close > lvl
-            and last.close > last.open
-        ):
-            continue
-
-        if not buy and not (
-            ex > lvl
-            and last.close < lvl
-            and last.close < last.open
-        ):
-            continue
-
-        pos = list(w.index).index(
-            w.low.idxmin() if buy else w.high.idxmax()
-        )
-
-        mid = w.iloc[pos:-1]
-
-        if len(mid) and (
-            (buy and last.close <= mid.high.max())
-            or (not buy and last.close >= mid.low.min())
-        ):
-            continue
-
-        e = last.close
-        d = 1 if buy else -1
-
-        return dict(
-            side="buy" if buy else "sell",
-            entry=round(e, 2),
-            sl=round(e - d * C["sl"], 2),
-            tps=[
-                round(e + d * x, 2)
-                for x in C["tp"]
-            ],
-            t=t_in.isoformat()
-        )
-
+def htf_poi(df30, t0, sweep_high):
+    hist = df30[df30.index + M30 <= t0].tail(60)
+    for _, zlow, zhigh, kind in reversed(bearish_zones(hist)):
+        if zlow <= sweep_high <= zhigh + ZONE_TOL:
+            return {"kind": kind, "low": zlow, "high": zhigh}
     return None
 
 
-# ==================================================
-# TRADE MANAGEMENT
-# ==================================================
+# ========================= SETUP DETECTION =========================
+def detect_sell(df3, df30, t0):
+    prev_t = t0 - M30
+    if prev_t not in df30.index:
+        return None
+    prev_high = df30.loc[prev_t, "high"]
+    idx = df3.index
+    O, H, L, C = (df3[x].values for x in ("open", "high", "low", "close"))
+    n = len(df3)
 
-def step(s, b):
-    """يحدّث الصفقة بشمعة واحدة. الوقف أولاً عند التعارض داخل الشمعة."""
+    win = [i for i in range(n) if t0 <= idx[i] < t0 + M30]
+    a = next((i for i in win if H[i] > prev_high), None)              # first break of the high
+    if a is None:
+        return None
+    c = next((i for i in win if i >= a and C[i] < prev_high), None)   # close back inside
+    if c is None:
+        return None
 
-    ev = []
-    buy = s["side"] == "buy"
-    d = 1 if buy else -1
-    k = len(s["tps"])
+    # MSS reference: last 3m swing low before the sweep
+    lows = [p for p in swing_lows(L[:a], SWING_K_MSS) if p >= a - 60]
+    ref = L[lows[-1]] if lows else L[max(0, a - 10):a].min()
+    m = next((i for i in range(c, n) if C[i] < ref), None)
+    if m is None:
+        return None
 
-    if (b.low <= s["cur_sl"]) if buy else (b.high >= s["cur_sl"]):
-        s["pnl"] += (
-            (k - s["stage"]) / k
-            * d
-            * (s["cur_sl"] - s["entry"])
-        )
+    h_pos = a + int(H[a:m + 1].argmax())
+    sweep = H[h_pos]
 
-        s["closed"] = True
-        ev.append("SL" if s["stage"] == 0 else "BE")
-        return ev
+    # entry zone: last bearish FVG in the displacement, else the last up-candle (OB)
+    zone = None
+    for i in range(h_pos + 2, m + 1):
+        if L[i - 2] > H[i]:
+            zone = (H[i], L[i - 2], "FVG")
+    if zone is None:
+        for j in range(m - 1, a - 1, -1):
+            if C[j] > O[j]:
+                zone = (L[j], H[j], "OB")
+                break
+    if zone is None:
+        return None
 
-    while s["stage"] < k:
+    entry = zone[0] if ENTRY_MODE == "proximal" else (zone[0] + zone[1]) / 2
+    sl = sweep
+    if entry >= sl:
+        return None
+    risk = sl - entry
 
-        tp = s["tps"][s["stage"]]
+    # targets: untouched lows on the left (before the sweep)
+    cands = []
+    for p in swing_lows(L[:a], SWING_K_TP):
+        price = L[p]
+        if price < entry and L[p + 1:m + 1].min() > price:
+            cands.append(price)
+    cands.sort(reverse=True)
+    tp1 = next((p for p in cands if (entry - p) / risk >= MIN_RR_TP1), None)
+    if tp1 is None:
+        return None
+    tp2 = next((p for p in cands if p < tp1), None)
+    if tp2 is None:
+        return None
 
-        if (b.high >= tp) if buy else (b.low <= tp):
-
-            s["pnl"] += d * (tp - s["entry"]) / k
-            s["stage"] += 1
-            ev.append(f"TP{s['stage']}")
-
-            if s["stage"] == 1:
-                s["cur_sl"] = s["entry"]
-
+    status = "pending"
+    for i in range(m + 1, n):
+        if status == "pending":
+            if H[i] >= sl:
+                status = "invalid"
+                break
+            if L[i] <= tp1:
+                status = "missed"
+                break
+            if H[i] >= entry:
+                status = "active"
         else:
-            break
-
-    if s["stage"] == k:
-        s["closed"] = True
-
-    return ev
-
-
-# ==================================================
-# TELEGRAM
-# ==================================================
-
-def tg(msg):
-    print(msg)
-
-    if TG_TOKEN:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={
-                "chat_id": TG_CHAT,
-                "text": msg
-            },
-            timeout=30
-        )
-
-
-def pips(a, b):
-    return round(abs(a - b) * 10)
-
-
-def fmt(s):
-    t = pd.to_datetime(s["t"]) + timedelta(hours=1)
-
-    buy = s["side"] == "buy"
-    head = "🟢 BUY" if buy else "🔴 SELL"
-
-    tps = "\n".join(
-        f"✅ TP{i+1}: {x} (+{pips(x, s['entry'])})"
-        for i, x in enumerate(s["tps"])
-    )
-
-    return (
-        f"{head} XAUUSD (الآن)\n"
-        f"⏰ {t:%H:%M} (الجزائر)\n"
-        f"➡️ الدخول: {s['entry']}\n"
-        f"🛑 الوقف: {s['sl']} "
-        f"({pips(s['entry'], s['sl'])} pip)\n"
-        f"{tps}\n"
-        f"📌 عند TP1: انقل الوقف إلى الدخول\n"
-        f"⚠️ لا تدخل إذا ابتعد السعر أكثر من 10 pip عن الدخول"
-    )
-
-
-MSG = {
-    "TP1": "✅ TP1 تحقق — انقل الوقف إلى الدخول",
-    "TP2": "🏁 TP2 تحقق — اكتملت الصفقة",
-    "SL": "❌ ضُرب الوقف",
-    "BE": "⚪ أُغلقت على نقطة الدخول"
-}
-
-
-# ==================================================
-# LIVE
-# ==================================================
-
-def load():
-    try:
-        return json.load(open(STATE))
-
-    except Exception:
-        return dict(
-            open=None,
-            day=None,
-            n=0,
-            sl=0,
-            pnl=0.0,
-            last_sig=None,
-            cool=None
-        )
-
-
-def live():
-    st = load()
-    now = datetime.now(timezone.utc)
-
-    df = fetch(300)
-
-    df = df[
-        df.t + timedelta(minutes=BAR) <= now
-    ].reset_index(drop=True)
-
-    day = now.date().isoformat()
-
-    if st["day"] != day:
-        st.update(
-            day=day,
-            n=0,
-            sl=0,
-            pnl=0.0
-        )
-
-    s = st["open"]
-
-    if s:
-        since = pd.to_datetime(s["t"])
-
-        seen = (
-            pd.to_datetime(s["seen"])
-            if s.get("seen")
-            else None
-        )
-
-        for _, b in df[df.t >= since].iterrows():
-
-            if seen is not None and b.t <= seen:
-                continue
-
-            s["seen"] = b.t.isoformat()
-
-            for e in step(s, b):
-                tg(
-                    f"{MSG[e]}\n"
-                    f"({s['side'].upper()} @ {s['entry']})"
-                )
-
-            if s["closed"]:
+            if H[i] >= sl:
+                status = "stopped"
+                break
+            if L[i] <= tp1:
+                status = "tp1"
                 break
 
-        if s["closed"]:
-
-            st["pnl"] += s["pnl"] - SPREAD
-
-            if s["stage"] == 0:
-                st["sl"] += 1
-
-            st["open"], st["cool"] = None, now.isoformat()
-
-        elif (
-            now - since > timedelta(hours=C["expire_h"])
-            and s["stage"] == 0
-        ):
-
-            tg(
-                f"⏱ انتهت صلاحية الصفقة "
-                f"({s['side'].upper()} @ {s['entry']}) "
-                f"— أغلقها يدوياً"
-            )
-
-            st["open"], st["cool"] = None, now.isoformat()
-
-    if not st["open"] and len(df):
-
-        last_t = df.t.iloc[-1] + timedelta(minutes=BAR)
-
-        fresh = (
-            now - last_t
-            <= timedelta(minutes=STALE_MIN)
-        )
-
-        cool = (
-            st["cool"]
-            and now - pd.to_datetime(st["cool"])
-            < timedelta(minutes=C["cool_min"])
-        )
-
-        blocked = (
-            st["n"] >= C["max_signals"]
-            or st["sl"] >= C["max_sl"]
-            or st["pnl"] >= C["day_target"]
-            or cool
-        )
-
-        if fresh and not blocked:
-
-            sg = signal(df)
-
-            if sg and sg["t"] != st["last_sig"]:
-
-                tg(fmt(sg))
-
-                st["last_sig"] = sg["t"]
-
-                st["open"] = dict(
-                    sg,
-                    cur_sl=sg["sl"],
-                    stage=0,
-                    pnl=0.0,
-                    closed=False,
-                    seen=None
-                )
-
-                st["n"] += 1
-
-    json.dump(st, open(STATE, "w"), indent=1)
+    return dict(entry=entry, sl=sl, tp1=tp1, tp2=tp2, sweep=sweep, mss=ref,
+                zone=zone, status=status, mss_time=idx[m], risk=risk,
+                sweep_time=idx[a])
 
 
-# ==================================================
-# MAIN
-# ==================================================
+def analyze(df3, df30, t0):
+    out = []
+    for side in ("sell", "buy"):
+        d3, d30 = (df3, df30) if side == "sell" else (flip(df3), flip(df30))
+        r = detect_sell(d3, d30, t0)
+        if not r:
+            continue
+        poi = htf_poi(d30, t0, r["sweep"])
+        if HTF_POI_REQUIRED and not poi:
+            continue
+        if side == "buy":
+            for k in ("entry", "sl", "tp1", "tp2", "sweep", "mss"):
+                r[k] = -r[k]
+            z = r["zone"]
+            r["zone"] = (-z[1], -z[0], z[2])
+            if poi:
+                poi = {"kind": poi["kind"], "low": -poi["high"], "high": -poi["low"]}
+        r["poi"], r["side"], r["t0"] = poi, side, t0
+        out.append(r)
+    if len(out) > 1:   # both high and low swept: keep the earlier one
+        out = [min(out, key=lambda x: x["sweep_time"])]
+    return out
+
+
+def half_cancelled(df3, df30, t0):
+    """The :30 candle is cancelled when the :00 candle before it already took liquidity."""
+    if t0.minute != 30:
+        return False
+    first, prev = t0 - M30, t0 - 2 * M30
+    if first not in df30.index or prev not in df30.index:
+        return False
+    if CANCEL_HALF_IF == "setup":
+        return bool(analyze(df3, df30, first))
+    f, p = df30.loc[first], df30.loc[prev]
+    return bool(f["high"] > p["high"] or f["low"] < p["low"])
+
+
+# ============================== TIMING ==============================
+def active_windows(now):
+    if now.weekday() >= 5:
+        return []
+    out = []
+    for h, m in GOLDEN:
+        t0 = now.normalize().replace(hour=h, minute=m)
+        if t0 <= now < t0 + WINDOW_AFTER:
+            out.append(t0)
+    return out
+
+
+def upcoming(now):
+    if now.weekday() >= 5:
+        return False
+    for h, m in GOLDEN:
+        t0 = now.normalize().replace(hour=h, minute=m)
+        if now < t0 <= now + timedelta(minutes=UPCOMING_MIN):
+            return True
+    return False
+
+
+def scan(df1, now):
+    windows = active_windows(now)
+    if not windows:
+        return []
+    df3, df30 = resample(df1, "3min"), resample(df1, "30min")
+    out = []
+    for t0 in windows:
+        if half_cancelled(df3, df30, t0):
+            continue
+        out += analyze(df3, df30, t0)
+    return out
+
+
+# ============================ NOTIFICATIONS ============================
+def telegram(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print(text, flush=True)
+        return
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          data=dict(chat_id=TG_CHAT, text=text), timeout=20)
+        if r.status_code != 200:
+            print("telegram error:", r.status_code, r.text[:200], flush=True)
+    except Exception as e:
+        print("telegram exception:", e, flush=True)
+
+
+def ai_review(setup):
+    if not AI_KEY:
+        return ""
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json=dict(model="claude-sonnet-5-5", max_tokens=300, messages=[{
+                "role": "user",
+                "content": "You review XAUUSD setups of a liquidity-sweep + MSS strategy. "
+                           "Reply in Arabic, max 3 short lines: strengths, risks, score out of 10.\n"
+                           + json.dumps(setup, default=str)}]),
+            timeout=30)
+        return "\n\nClaude review:\n" + r.json()["content"][0]["text"]
+    except Exception as e:
+        print("ai_review error:", e, flush=True)
+        return ""
+
+
+def format_msg(r):
+    side = "SELL \U0001F534" if r["side"] == "sell" else "BUY \U0001F7E2"
+    rr1 = abs(r["entry"] - r["tp1"]) / r["risk"]
+    rr2 = abs(r["entry"] - r["tp2"]) / r["risk"]
+    z, poi = r["zone"], r["poi"]
+    if poi:
+        poi_txt = "%s 30m [%.2f - %.2f]" % (poi["kind"], poi["low"], poi["high"])
+    else:
+        poi_txt = "none"
+    state = ("Limit order pending (price has not returned yet)" if r["status"] == "pending"
+             else "Price already touched the entry zone")
+    return (
+        f"{side} XAUUSD\n"
+        f"Golden candle: {r['t0']:%H:%M} NY | Sweep {r['sweep_time']:%H:%M} | MSS {r['mss_time']:%H:%M}\n"
+        f"HTF zone: {poi_txt}\n"
+        f"Entry zone (3m): {z[2]} [{z[0]:.2f} - {z[1]:.2f}]\n\n"
+        f"Entry: {r['entry']:.2f}\n"
+        f"SL: {r['sl']:.2f}\n"
+        f"TP1: {r['tp1']:.2f} (RR {rr1:.1f})\n"
+        f"TP2: {r['tp2']:.2f} (RR {rr2:.1f})\n\n"
+        f"Status: {state}\n"
+        f"Not financial advice."
+    )
+
+
+def load_seen():
+    try:
+        return set(json.load(open(SEEN_FILE)))
+    except Exception:
+        return set()
+
+
+def save_seen(s):
+    try:
+        json.dump(sorted(s), open(SEEN_FILE, "w"))
+    except Exception:
+        pass
+
+
+# =============================== MAIN ===============================
+def run_scan(now, seen):
+    df1 = fetch_1m(now)
+    found = scan(df1, now)
+    sent = 0
+    for r in found:
+        if r["status"] not in ("pending", "active"):
+            continue
+        key = f"{r['t0'].isoformat()}_{r['side']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        save_seen(seen)
+        telegram(format_msg(r) + ai_review(r))
+        sent += 1
+    return len(found), sent
+
 
 def main():
-    import sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        telegram("TS Bot: Telegram connection OK")
+        return
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "live"
-
-    if mode == "live":
-        live()
-
-    elif mode == "test":
-        tg("✅ البوت متصل")
-
-    else:
-        print("Unknown mode. Use: live or test")
+    one_shot = bool(os.getenv("ONE_SHOT"))
+    seen = load_seen()
+    print("TS bot started", flush=True)
+    while True:
+        try:
+            now = pd.Timestamp.now(tz=NY)
+            busy = bool(active_windows(now))
+            if one_shot and not busy and not upcoming(now):
+                print("no golden window now, exiting", flush=True)
+                return
+            if busy:
+                found, sent = run_scan(now, seen)
+                print(f"[{now:%H:%M} NY] scanned: setups={found} sent={sent}", flush=True)
+            else:
+                print(f"[{now:%H:%M} NY] waiting for the next golden candle", flush=True)
+        except Exception as e:
+            print("error:", e, flush=True)
+        if args.once:
+            return
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
