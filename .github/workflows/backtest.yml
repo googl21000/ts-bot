@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       days:
-        description: "عدد الأيام للباكتيست"
+        description: "Number of days"
         required: true
         default: "90"
 
@@ -33,8 +33,10 @@ jobs:
         env:
           BT_DAYS: ${{ inputs.days }}
           TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
 
-      - name: Upload Backtest CSV
+      - name: Upload CSV Results
         uses: actions/upload-artifact@v4
         with:
           name: TS-bot-backtest-results
