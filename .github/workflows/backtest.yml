@@ -40,5 +40,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TS-bot-backtest-results
-          path: backtest_trades.csv
+          path:  backtest_trend.csv
+                 backtest_no_trend.csv
+                 candles_5m.csv
           if-no-files-found: error
