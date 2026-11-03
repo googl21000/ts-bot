@@ -48,6 +48,8 @@ if os.getenv("CANCEL_HALF_IF") in ("sweep", "setup"):
     b.CANCEL_HALF_IF = os.getenv("CANCEL_HALF_IF")
 if os.getenv("ENTRY_MODE") in ("mss", "proximal", "mid"):
     b.ENTRY_MODE = os.getenv("ENTRY_MODE")
+if os.getenv("SL_MODE") in ("swept", "sweep"):
+    b.SL_MODE = os.getenv("SL_MODE")
 
 
 # ============================== DATA ==============================
@@ -184,7 +186,7 @@ def build_summary(tr, df1, windows_n):
     lines = [
         f"TS Strategy Backtest - XAUUSD",
         f"Period: {df1.index[0]:%Y-%m-%d} to {df1.index[-1]:%Y-%m-%d} (NY) | golden candles checked: {windows_n}",
-        f"HTF zone required: {b.HTF_POI_REQUIRED} | cancel :30 if :00 {b.CANCEL_HALF_IF} | entry: {b.ENTRY_MODE}",
+        f"HTF zone required: {b.HTF_POI_REQUIRED} | cancel :30 if :00 {b.CANCEL_HALF_IF} | entry: {b.ENTRY_MODE} | SL: {b.SL_MODE}",
         f"Costs: ${COST_USD:.2f} per trade | SL counted first when ambiguous",
         "",
         f"Signals: {len(tr)} | filled: {int(tr['filled'].sum()) if len(tr) else 0} | "
@@ -264,9 +266,52 @@ def golden_windows(df1, days):
     return out
 
 
+def debug_day(df1, date_str):
+    """Explain every golden candle of one day step by step, and dump the bot's own candles
+    so they can be compared with TradingView (feeds differ by a few tenths of a dollar)."""
+    day = pd.Timestamp(date_str, tz=b.NY).normalize()
+    df3, df30 = b.resample(df1, "3min"), b.resample(df1, "30min")
+    out = [f"DEBUG {date_str} (New York time) - the bot's own data feed",
+           f"settings: HTF required={b.HTF_POI_REQUIRED} | cancel :30 if :00 {b.CANCEL_HALF_IF} | "
+           f"entry={b.ENTRY_MODE} | SL={b.SL_MODE} | MSS swing k={b.SWING_K_MSS}", ""]
+    if day.weekday() >= 5:
+        out.append("this day is a weekend - the bot does not trade it")
+    for h, m in b.GOLDEN:
+        t0 = day.replace(hour=h, minute=m)
+        end = t0 + b.WINDOW_AFTER
+        d3 = df3[df3.index + M3 <= end].tail(1000)
+        d30 = df30[df30.index + M30 <= end].tail(100)
+        if len(d3) < 200 or d3.index[-1] < t0:
+            out.append(f"== {t0:%H:%M}: no data ==")
+            continue
+        out.append(f"== golden candle {t0:%H:%M} ==")
+        if b.half_cancelled(d3, d30, t0):
+            out.append("  CANCELLED: the :00 candle before it already took liquidity")
+        out += b.explain(d3, d30, t0)
+        out.append("")
+    for h, m in ((2, 0), (7, 0), (9, 0)):
+        t0 = day.replace(hour=h, minute=m)
+        seg = df3[(df3.index >= t0 - pd.Timedelta(minutes=30)) & (df3.index < t0 + pd.Timedelta(minutes=60))]
+        out.append(f"-- 3m candles {t0 - pd.Timedelta(minutes=30):%H:%M} to {t0 + pd.Timedelta(minutes=60):%H:%M} --")
+        for t, r in seg.iterrows():
+            out.append(f"{t:%H:%M}  O {r.open:.2f}  H {r.high:.2f}  L {r.low:.2f}  C {r.close:.2f}")
+        out.append("")
+    text = "\n".join(out)
+    print(text, flush=True)
+    open("backtest_debug.txt", "w").write(text)
+    b.telegram(f"Debug for {date_str} is ready (see the attached file).")
+    tg_file("backtest_debug.txt", "document")
+
+
 def main():
+    debug_date = (os.getenv("DEBUG_DATE") or "").strip()
+    if debug_date:
+        back = (pd.Timestamp.now(tz=b.NY).normalize() - pd.Timestamp(debug_date, tz=b.NY)).days + 4
+        print(f"Debug mode for {debug_date}", flush=True)
+        debug_day(fetch_history(max(back, 8)), debug_date)
+        return
     print(f"Backtest: last {DAYS} days | HTF required={b.HTF_POI_REQUIRED} "
-          f"cancel={b.CANCEL_HALF_IF} entry={b.ENTRY_MODE}", flush=True)
+          f"cancel={b.CANCEL_HALF_IF} entry={b.ENTRY_MODE} SL={b.SL_MODE}", flush=True)
     df1 = fetch_history(DAYS)
     data_report(df1)
     df3_all, df30_all = b.resample(df1, "3min"), b.resample(df1, "30min")
