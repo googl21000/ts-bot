@@ -34,7 +34,8 @@ ZONE_TOL = 2.0             # tolerance (USD) for "inside the 30m zone"
 ENTRY_MODE = "mss"         # "mss" = retest of the broken MSS level | "proximal" = near edge of the 3m zone | "mid" = middle of it
 MIN_RR_TP1 = 1.0           # minimum reward/risk for TP1
 CANCEL_HALF_IF = "sweep"   # cancel the :30 candle if the :00 candle ... "sweep" | "setup"
-SWING_K_MSS = 2            # swing strength used for the MSS reference (3m)
+SWING_K_MSS = 1            # MSS level = last 3-candle swing low/high before the sweep (1 candle each side)
+SL_MODE = "swept"          # "swept" = stop at the swept 30m candle's high/low | "sweep" = beyond the sweep wick
 SWING_K_TP = 5             # swing strength used for TP liquidity (3m)
 WINDOW_AFTER = timedelta(minutes=60)   # how long a golden candle stays active
 UPCOMING_MIN = 35          # session start buffer before a golden candle
@@ -116,32 +117,58 @@ def htf_poi(df30, t0, sweep_high):
 
 
 # ========================= SETUP DETECTION =========================
-def detect_sell(df3, df30, t0):
+def detect_sell(df3, df30, t0, log=None, sgn=1):
+    """Sell setup for the golden 30m candle starting at t0 (buys run on mirrored prices).
+    `log` (optional list) receives a step-by-step explanation; `sgn` only fixes the printed prices."""
+    hi_w, lo_w = ("high", "low") if sgn == 1 else ("low", "high")
+
+    def say(msg):
+        if log is not None:
+            log.append(msg)
+
+    def fx(v):
+        return f"{sgn * v:.2f}"
+
     prev_t = t0 - M30
     if prev_t not in df30.index:
+        say(f"no 30m candle at {prev_t:%H:%M} in the data")
         return None
     prev_high = df30.loc[prev_t, "high"]
+    say(f"previous 30m candle {prev_t:%H:%M}: {hi_w} {fx(prev_high)} (the level to be swept)")
     idx = df3.index
     O, H, L, C = (df3[x].values for x in ("open", "high", "low", "close"))
     n = len(df3)
 
     win = [i for i in range(n) if t0 <= idx[i] < t0 + M30]
-    a = next((i for i in win if H[i] > prev_high), None)              # first break of the high
-    if a is None:
+    if not win:
+        say("no 3m candles in this 30m window yet")
         return None
+    a = next((i for i in win if H[i] > prev_high), None)              # first break of the level
+    if a is None:
+        say(f"NO SWEEP: this candle's {hi_w} reached only {fx(max(H[i] for i in win))}, "
+            f"it must pass {fx(prev_high)}")
+        return None
+    say(f"sweep: 3m candle {idx[a]:%H:%M} broke it ({hi_w} {fx(H[a])})")
     c = next((i for i in win if i >= a and C[i] < prev_high), None)   # close back inside
     if c is None:
+        say("no 3m close back inside the swept level yet")
         return None
 
-    # MSS reference: last 3m swing low before the sweep.
-    # The sweep candle itself counts as the right-hand confirmation (L[:a + 1]), so a low
-    # that formed 1-2 candles before the sweep is found (it used to be skipped, and an older,
-    # lower swing low was used -> MSS fired late and the entry was already gone).
+    # MSS level: last 3m swing low before the sweep. The sweep candle counts as the right-hand
+    # confirmation (L[:a + 1]) so a low 1-2 candles before the sweep is found.
     lows = [p for p in swing_lows(L[:a + 1], SWING_K_MSS) if p >= a - 60]
-    ref = L[lows[-1]] if lows else L[max(0, a - 10):a].min()
+    if lows:
+        ref = L[lows[-1]]
+        say(f"MSS level: last swing {lo_w} before the sweep = {fx(ref)} (candle {idx[lows[-1]]:%H:%M})")
+    else:
+        ref = L[max(0, a - 10):a].min()
+        say(f"MSS level: no swing {lo_w} found, using the lowest of the last 10 candles = {fx(ref)}")
     m = next((i for i in range(c, n) if C[i] < ref), None)
     if m is None:
+        say(f"NO MSS YET: no 3m close beyond {fx(ref)} (closest close so far {fx(C[c:].min())})")
         return None
+    say(f"MSS: 3m candle {idx[m]:%H:%M} closed at {fx(C[m])}, beyond {fx(ref)} "
+        f"(candle #{m - win[0] + 1} counting from {t0:%H:%M})")
 
     h_pos = a + int(H[a:m + 1].argmax())
     sweep = H[h_pos]
@@ -157,7 +184,10 @@ def detect_sell(df3, df30, t0):
                 zone = (L[j], H[j], "OB")
                 break
     if zone is None:
+        say("no OB/FVG found in the move after the sweep")
         return None
+    zl, zh = sorted((sgn * zone[0], sgn * zone[1]))
+    say(f"entry zone (3m): {zone[2]} [{zl:.2f} - {zh:.2f}]")
 
     if ENTRY_MODE == "mss":
         entry = ref                      # retest of the broken MSS level
@@ -165,10 +195,12 @@ def detect_sell(df3, df30, t0):
         entry = (zone[0] + zone[1]) / 2
     else:
         entry = zone[0]                  # "proximal": near edge of the entry zone
-    sl = sweep
+    sl = prev_high if SL_MODE == "swept" else sweep
     if entry >= sl:
+        say(f"entry {fx(entry)} is not on the right side of the stop {fx(sl)} - skipped")
         return None
     risk = sl - entry
+    say(f"entry {fx(entry)} ({ENTRY_MODE}) | SL {fx(sl)} ({SL_MODE}) | risk {risk:.2f}")
 
     # targets: untouched lows on the left (before the sweep)
     cands = []
@@ -177,12 +209,17 @@ def detect_sell(df3, df30, t0):
         if price < entry and L[p + 1:m + 1].min() > price:
             cands.append(price)
     cands.sort(reverse=True)
+    say(f"left liquidity below entry (nearest first): " + (", ".join(
+        f"{fx(p)} (RR {(entry - p) / risk:.2f})" for p in cands[:6]) or "none"))
     tp1 = next((p for p in cands if (entry - p) / risk >= MIN_RR_TP1), None)
     if tp1 is None:
+        say(f"no low gives at least {MIN_RR_TP1}:1 - skipped")
         return None
     tp2 = next((p for p in cands if p < tp1), None)
     if tp2 is None:
+        say("no second target below TP1 - skipped")
         return None
+    say(f"TP1 {fx(tp1)} (RR {(entry - tp1) / risk:.2f}) | TP2 {fx(tp2)} (RR {(entry - tp2) / risk:.2f})")
 
     status = "pending"
     for i in range(m + 1, n):
@@ -202,6 +239,7 @@ def detect_sell(df3, df30, t0):
             if L[i] <= tp1:
                 status = "tp1"
                 break
+    say(f"status: {status}")
 
     return dict(entry=entry, sl=sl, tp1=tp1, tp2=tp2, sweep=sweep, mss=ref,
                 zone=zone, status=status, mss_time=idx[m], risk=risk,
@@ -230,6 +268,18 @@ def analyze(df3, df30, t0):
     if len(out) > 1:   # both high and low swept: keep the earlier one
         out = [min(out, key=lambda x: x["sweep_time"])]
     return out
+
+
+def explain(df3, df30, t0):
+    """Human-readable trace of why a golden candle did / did not give a setup (both sides)."""
+    lines = []
+    for side in ("sell", "buy"):
+        d3, d30, sgn = (df3, df30, 1) if side == "sell" else (flip(df3), flip(df30), -1)
+        log = []
+        detect_sell(d3, d30, t0, log=log, sgn=sgn)
+        lines.append(f"-- {t0:%H:%M} {side.upper()} --")
+        lines += ["  " + x for x in log]
+    return lines
 
 
 def half_cancelled(df3, df30, t0):
