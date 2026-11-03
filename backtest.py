@@ -1,4 +1,3 @@
-
 """
 Backtest for the TS strategy (XAUUSD) - uses the SAME detection code as ts_bot.py.
 
@@ -47,7 +46,7 @@ if os.getenv("HTF_REQUIRED"):
     b.HTF_POI_REQUIRED = os.getenv("HTF_REQUIRED").strip().lower() == "true"
 if os.getenv("CANCEL_HALF_IF") in ("sweep", "setup"):
     b.CANCEL_HALF_IF = os.getenv("CANCEL_HALF_IF")
-if os.getenv("ENTRY_MODE") in ("proximal", "mid"):
+if os.getenv("ENTRY_MODE") in ("mss", "proximal", "mid"):
     b.ENTRY_MODE = os.getenv("ENTRY_MODE")
 
 
@@ -291,6 +290,9 @@ def main():
             row = dict(date=f"{t0:%Y-%m-%d}", golden=f"{t0:%H:%M}", side=r["side"],
                        htf=(r["poi"]["kind"] if r["poi"] else ""), zone=r["zone"][2],
                        signal_time=f"{signal_time:%Y-%m-%d %H:%M}",
+                       sweep_time=f"{r['sweep_time']:%H:%M}", mss_time=f"{r['mss_time']:%H:%M}",
+                       mss_level=round(r["mss"], 2),
+                       zone_lo=round(r["zone"][0], 2), zone_hi=round(r["zone"][1], 2),
                        entry=round(r["entry"], 2), sl=round(r["sl"], 2),
                        tp1=round(r["tp1"], 2), tp2=round(r["tp2"], 2),
                        rr1=round(abs(r["entry"] - r["tp1"]) / r["risk"], 2),
