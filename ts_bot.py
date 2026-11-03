@@ -32,9 +32,9 @@ GOLDEN = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
 HTF_POI_REQUIRED = True    # sweep must happen inside a 30m FVG/OB
 ZONE_TOL = 2.0             # tolerance (USD) for "inside the 30m zone"
 ENTRY_MODE = "mss"         # "mss" = retest of the broken MSS level | "proximal" = near edge of the 3m zone | "mid" = middle of it
-MIN_RR_TP1 = 1.0           # minimum reward/risk for TP1
+MIN_RR_TP1 = 1.5     # minimum reward/risk for TP1
 CANCEL_HALF_IF = "sweep"   # cancel the :30 candle if the :00 candle ... "sweep" | "setup"
-SWING_K_MSS = 1            # MSS level = last 3-candle swing low/high before the sweep (1 candle each side)
+SWING_K_MSS = 2         # MSS level = last 3-candle swing low/high before the sweep (1 candle each side)
 SL_MODE = "swept"          # "swept" = stop at the swept 30m candle's high/low | "sweep" = beyond the sweep wick
 SWING_K_TP = 5             # swing strength used for TP liquidity (3m)
 WINDOW_AFTER = timedelta(minutes=60)   # how long a golden candle stays active
