@@ -326,7 +326,8 @@ def main():
         if b.half_cancelled(d3, d30, t0):
             continue
         for r in b.analyze(d3, d30, t0):
-            signal_time = r["mss_time"] + M3                     # candle close = when the bot alerts
+             signal_time = r["mss_time"] + M3 + pd.Timedelta(minutes=2)
+                 # candle close = when the bot alerts
             post = df1[(df1.index >= signal_time) &
                        (df1.index < signal_time + pd.Timedelta(minutes=HORIZON_MIN))]
             if post.empty:
