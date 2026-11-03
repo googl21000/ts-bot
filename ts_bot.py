@@ -31,7 +31,7 @@ GOLDEN = [(2, 0), (2, 30), (7, 0), (7, 30), (9, 0), (9, 30)]
 
 HTF_POI_REQUIRED = True    # sweep must happen inside a 30m FVG/OB
 ZONE_TOL = 2.0             # tolerance (USD) for "inside the 30m zone"
-ENTRY_MODE = "proximal"    # "proximal" = near edge of the entry zone | "mid" = middle
+ENTRY_MODE = "mss"         # "mss" = retest of the broken MSS level | "proximal" = near edge of the 3m zone | "mid" = middle of it
 MIN_RR_TP1 = 1.0           # minimum reward/risk for TP1
 CANCEL_HALF_IF = "sweep"   # cancel the :30 candle if the :00 candle ... "sweep" | "setup"
 SWING_K_MSS = 2            # swing strength used for the MSS reference (3m)
@@ -133,8 +133,11 @@ def detect_sell(df3, df30, t0):
     if c is None:
         return None
 
-    # MSS reference: last 3m swing low before the sweep
-    lows = [p for p in swing_lows(L[:a], SWING_K_MSS) if p >= a - 60]
+    # MSS reference: last 3m swing low before the sweep.
+    # The sweep candle itself counts as the right-hand confirmation (L[:a + 1]), so a low
+    # that formed 1-2 candles before the sweep is found (it used to be skipped, and an older,
+    # lower swing low was used -> MSS fired late and the entry was already gone).
+    lows = [p for p in swing_lows(L[:a + 1], SWING_K_MSS) if p >= a - 60]
     ref = L[lows[-1]] if lows else L[max(0, a - 10):a].min()
     m = next((i for i in range(c, n) if C[i] < ref), None)
     if m is None:
@@ -156,7 +159,12 @@ def detect_sell(df3, df30, t0):
     if zone is None:
         return None
 
-    entry = zone[0] if ENTRY_MODE == "proximal" else (zone[0] + zone[1]) / 2
+    if ENTRY_MODE == "mss":
+        entry = ref                      # retest of the broken MSS level
+    elif ENTRY_MODE == "mid":
+        entry = (zone[0] + zone[1]) / 2
+    else:
+        entry = zone[0]                  # "proximal": near edge of the entry zone
     sl = sweep
     if entry >= sl:
         return None
@@ -321,6 +329,7 @@ def format_msg(r):
         f"{side} XAUUSD\n"
         f"Golden candle: {r['t0']:%H:%M} NY | Sweep {r['sweep_time']:%H:%M} | MSS {r['mss_time']:%H:%M}\n"
         f"HTF zone: {poi_txt}\n"
+        f"MSS level: {r['mss']:.2f}\n"
         f"Entry zone (3m): {z[2]} [{z[0]:.2f} - {z[1]:.2f}]\n\n"
         f"Entry: {r['entry']:.2f}\n"
         f"SL: {r['sl']:.2f}\n"
