@@ -22,9 +22,10 @@ on:
         description: 'Entry inside the zone'
         type: choice
         options:
+          - mss
           - proximal
           - mid
-        default: proximal
+        default: mss
 
 jobs:
   backtest:
