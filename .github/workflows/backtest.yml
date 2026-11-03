@@ -18,6 +18,17 @@ on:
           - sweep
           - setup
         default: sweep
+      sl_mode:
+        description: 'Stop loss: swept = swept 30m candle high/low | sweep = beyond the sweep wick'
+        type: choice
+        options:
+          - swept
+          - sweep
+        default: swept
+      debug_date:
+        description: 'Debug ONE day instead (YYYY-MM-DD), leave empty for the normal backtest'
+        type: string
+        default: ''
       entry_mode:
         description: 'Entry inside the zone'
         type: choice
@@ -46,6 +57,8 @@ jobs:
           HTF_REQUIRED: ${{ github.event.inputs.htf_required }}
           CANCEL_HALF_IF: ${{ github.event.inputs.cancel_half_if }}
           ENTRY_MODE: ${{ github.event.inputs.entry_mode }}
+          SL_MODE: ${{ github.event.inputs.sl_mode }}
+          DEBUG_DATE: ${{ github.event.inputs.debug_date }}
         run: python backtest.py
       - uses: actions/upload-artifact@v4
         if: always()
@@ -55,4 +68,5 @@ jobs:
             backtest_summary.txt
             backtest_trades.csv
             backtest_equity.png
+            backtest_debug.txt
           if-no-files-found: ignore
